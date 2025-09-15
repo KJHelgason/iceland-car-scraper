@@ -6,6 +6,8 @@ from db.reference_price_updater import update_reference_prices
 from deal_checker import check_for_deals
 from analysis.train_price_models import train_and_store
 from scrapers.dealerships.bilasolur_seed_links import discover_bilasolur_links
+from cleaners.clean_data import run_all_cleaners
+from analysis.update_daily_deals import update_daily_deals
 
 if __name__ == "__main__":
     print("Choose an option:")
@@ -17,6 +19,8 @@ if __name__ == "__main__":
     print("6 - Run all dealership scrapers")
     print("7 - Train price prediction models")
     print("8 - Discover Bilasolur category URLs and scrape")
+    print("9 - Clean data (remove non-cars, dead URLs, duplicates)")
+    print("10 - Rebuild daily deals (Top 10)")
     choice = input("Enter choice: ").strip()
 
     if choice == "1":
@@ -56,5 +60,12 @@ if __name__ == "__main__":
         urls = asyncio.run(discover_bilasolur_links())
         print(f"Discovered {len(urls)} URLs. Starting scrape...")
         asyncio.run(scrape_bilasolur(start_urls=urls, max_pages=500))
+    elif choice == "9":
+        print("Running cleaners (this may open headless browsers)…")
+        run_all_cleaners()
+        print("Cleaners finished.")
+    elif choice == "10":
+        print("Updating daily deals...")
+        update_daily_deals()
     else:
         print("Invalid choice.")

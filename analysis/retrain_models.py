@@ -1,7 +1,7 @@
 from sqlalchemy import delete
 from db.db_setup import SessionLocal
 from db.models import PriceModel
-from train_price_models import train_and_store
+from train_price_models_3 import train_and_store
 
 def retrain_all():
     """Clear existing price models and retrain with new normalization rules"""

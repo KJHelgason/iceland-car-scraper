@@ -1,6 +1,6 @@
 # db/models.py
 from datetime import datetime
-
+from sqlalchemy.sql import func
 from sqlalchemy import (
     Column,
     Integer,
@@ -11,6 +11,8 @@ from sqlalchemy import (
     ForeignKey,
     Text,
     UniqueConstraint,
+    Boolean,
+    Index,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -53,6 +55,7 @@ class CarListing(Base):
     url = Column(String, unique=True)
     description = Column(String)
     scraped_at = Column(DateTime)
+    is_active = Column(Boolean, nullable=False, default=True)
 
 
 # --- Reference prices (used by deal checker) ---
@@ -74,26 +77,77 @@ class ReferencePrice(Base):
     )
 
 
+class DailyDeal(Base):
+    __tablename__ = "daily_deals"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # reference to the original listing
+    listing_id = Column(Integer, ForeignKey("car_listings.id"), nullable=False)
+
+    # core listing fields (match car_listings)
+    source = Column(String)
+    title = Column(String)
+    make = Column(String, nullable=False)
+    model = Column(String, nullable=False)
+    year = Column(Integer, nullable=False)
+    price = Column(BigInteger, nullable=False)
+    kilometers = Column(BigInteger, nullable=False)
+    url = Column(String)
+    description = Column(Text)
+    scraped_at = Column(DateTime(timezone=True))
+
+    # deal metrics (these are what update_daily_deals.py writes)
+    estimated_price = Column(Float, nullable=False)
+    pct_below = Column(Float, nullable=False)          # percentage below estimate
+    model_rmse = Column(Float)                          # nullable
+    model_n = Column(Integer)                           # nullable
+    model_key = Column(String)                          # nullable
+    rank_score = Column(Float)                          # nullable
+
+    # bookkeeping
+    inserted_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),  # server-side default is handy
+    )
+    computed_at = Column(
+        DateTime(timezone=True),
+        nullable=False,             # script sets this explicitly
+    )
+
 # --- Price models (statistical models we trained) ---
 class PriceModel(Base):
     __tablename__ = "price_models"
-
     id = Column(Integer, primary_key=True)
-    tier = Column(String, index=True)            # "model" | "make" | "global"
-    make_norm = Column(String, index=True, nullable=True)
-    model_base = Column(String, index=True, nullable=True)
-    display_name = Column(String, nullable=True)  # User-friendly display name for the model
 
-    # coefficients for: intercept + beta_age + beta_logkm + beta_age_logkm
-    coef_json = Column(Text)  # JSON string: {"intercept":..., "beta_age":..., "beta_logkm":..., "beta_age_logkm":...}
+    # tiers: 'model_year', 'model', 'make', 'global'
+    tier = Column(String, nullable=False)
 
-    n_samples = Column(Integer)
-    r2 = Column(Float)
-    rmse = Column(Float)
-    trained_at = Column(DateTime, default=datetime.utcnow)
+    make_norm = Column(String, nullable=True, index=True)
+    model_base = Column(String, nullable=True, index=True)
+
+    # Per-year models store the calendar year here (nullable for pooled tiers)
+    year = Column(Integer, nullable=True, index=True)
+
+    # Display-friendly fields
+    display_make = Column(String, nullable=True)   # NEW: "Land Rover"
+    display_name = Column(String, nullable=True)   # Already exists — keep, but fix logic later
+
+    coef_json = Column(Text, nullable=False)
+
+    n_samples = Column(Integer, nullable=False, default=0)
+    r2 = Column(Float, nullable=False, default=0.0)
+    rmse = Column(Float, nullable=False, default=0.0)
+
+    trained_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("tier", "make_norm", "model_base", name="uq_price_models_bucket"),
+        # ensure uniqueness for the bucket including year
+        UniqueConstraint('tier', 'make_norm', 'model_base', 'year', name='price_models_unique'),
+        # helpful composite indexes
+        Index('ix_price_models_bucket', 'tier', 'make_norm', 'model_base'),
+        Index('ix_price_models_year_bucket', 'tier', 'make_norm', 'model_base', 'year'),
     )
 
 

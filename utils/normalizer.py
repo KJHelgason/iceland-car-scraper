@@ -107,6 +107,46 @@ DROP_TOKENS = {
     "616", "818", "519", "460", "37-tommu"
 }
 
+# Hand-curated overrides for tricky brand names
+MAKE_DISPLAY_OVERRIDES = {
+    "mercedes-benz": "Mercedes-Benz",
+    "land-rover": "Land Rover",
+    "range-rover": "Range Rover",
+    "rolls-royce": "Rolls-Royce",
+    "alfa-romeo": "Alfa Romeo",
+    "aston-martin": "Aston Martin",
+    "citroën": "Citroën",   # handle special char
+    "cupra": "CUPRA",       # brand prefers uppercase
+    "ds": "DS Automobiles",
+    "e": "E-Class",
+}
+
+# Acronyms / makes that should always stay uppercase
+MAKE_UPPER = {
+    "bmw","vw","gmc","mg","byd","nio","xpeng","saic",
+    "kia",
+}
+
+def pretty_make(make: str | None) -> str | None:
+    """Return a frontend-friendly display make (for display_make column)."""
+    if not make:
+        return None
+
+    mk = make.strip().lower()
+
+    # 1. Check overrides first
+    if mk in MAKE_DISPLAY_OVERRIDES:
+        return MAKE_DISPLAY_OVERRIDES[mk]
+
+    # 2. Preserve acronyms/brands that prefer uppercase
+    if mk in MAKE_UPPER:
+        return mk.upper()
+
+    # 3. Default: split on hyphens/spaces, capitalize words
+    tokens = mk.replace("-", " ").split()
+    return " ".join(t.capitalize() for t in tokens)
+
+
 def _strip_weird_spaces(s: str) -> str:
     s = s.replace("\xa0", " ").replace("&nbsp;", " ")
     return re.sub(r"\s+", " ", s).strip()
@@ -131,17 +171,36 @@ def normalize_model(model: str | None) -> str | None:
     return m or None
 
 def get_display_name(model: str | None) -> str | None:
-    """Get the user-friendly display name for a normalized model name"""
+    """Return a user-friendly display name for a normalized model name."""
     if not model:
         return None
-    
-    # Look up in our display names map first
+
+    # 1. Check overrides map first
     display_name = DISPLAY_NAMES.get(model)
     if display_name:
         return display_name
-        
-    # If no specific display name, capitalize words
-    return ' '.join(word.capitalize() for word in model.split())
+
+    # 2. Replace hyphens with spaces
+    s = model.replace("-", " ").strip().lower()
+
+    # 3. Preserve acronyms / tokens that should stay uppercase
+    UPPER = {
+        "gt","gti","gtd","rs","sti","xr","xjr","svr",
+        "gts","gls","gla","glc","gle","cls","amg",
+        "x5","x3","x1","x7","ix","i3","i4","m2","m3","m4","m5",
+        "ev","phev","tdi","tsi","dci","hdi","v8","v6","v12"
+    }
+
+    tokens = []
+    for t in s.split():
+        if t in UPPER:
+            tokens.append(t.upper())
+        elif t.isdigit():
+            tokens.append(t)  # leave pure numbers alone (e.g. "911")
+        else:
+            tokens.append(t.capitalize())
+
+    return " ".join(tokens)
 
 def model_base(model: str | None) -> str | None:
     """Get the base model name by removing trim levels and normalizing common variants"""
