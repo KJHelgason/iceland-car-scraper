@@ -195,16 +195,24 @@ async def scrape_bilasolur(max_pages: int = 3, start_urls: list[str] | None = No
                             kilometers = extract_kilometers(tech_text)
 
                 # Upsert
-                existing = session.query(CarListing).filter_by(url=link).first()
+                existing = (
+                    session.query(CarListing)
+                    .filter_by(
+                        source="Bilasolur",
+                        make=normalized_make,
+                        model=normalized_model,
+                        year=year,
+                        title=normalized_title,
+                    )
+                    .first()
+                )
+
                 if existing:
                     updated = False
                     for field, value in {
                         "price": price,
-                        "title": normalized_title,
-                        "make": normalized_make,
-                        "model": normalized_model,
-                        "year": year,
                         "kilometers": kilometers,
+                        "url": link,  # URL can change, keep the latest
                     }.items():
                         if value is not None and getattr(existing, field) != value:
                             setattr(existing, field, value)
@@ -212,21 +220,20 @@ async def scrape_bilasolur(max_pages: int = 3, start_urls: list[str] | None = No
                     if updated:
                         existing.scraped_at = datetime.utcnow()
                         updated_listings += 1
-                    continue
-
-                car = CarListing(
-                    source="Bilasolur",
-                    title=normalized_title,
-                    make=normalized_make,
-                    model=normalized_model,
-                    year=year,
-                    price=price,
-                    kilometers=kilometers,
-                    url=link,
-                    scraped_at=datetime.utcnow(),
-                )
-                session.add(car)
-                new_listings += 1
+                else:
+                    car = CarListing(
+                        source="Bilasolur",
+                        title=normalized_title,
+                        make=normalized_make,
+                        model=normalized_model,
+                        year=year,
+                        price=price,
+                        kilometers=kilometers,
+                        url=link,
+                        scraped_at=datetime.utcnow(),
+                    )
+                    session.add(car)
+                    new_listings += 1
 
             session.commit()
 

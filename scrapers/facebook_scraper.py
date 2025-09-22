@@ -196,17 +196,26 @@ async def scrape_facebook(max_items=20):
                 continue
 
             # Upsert
-            existing = session.query(CarListing).filter_by(url=url).first()
+                        # Upsert by (source, make, model, year, title)
+            existing = (
+                session.query(CarListing)
+                .filter_by(
+                    source="Facebook Marketplace",
+                    make=make,
+                    model=model,
+                    year=year,
+                    title=title,
+                )
+                .first()
+            )
+
             if existing:
                 updated = False
                 for field, value in {
                     "price": price,
-                    "title": title,
-                    "make": make,
-                    "model": model,
-                    "year": year,
                     "kilometers": mileage,
-                    "description": description
+                    "description": description,
+                    "url": url,  # ✅ allow updating URL since FB can rotate them
                 }.items():
                     if value is not None and getattr(existing, field) != value:
                         setattr(existing, field, value)
@@ -214,22 +223,22 @@ async def scrape_facebook(max_items=20):
                 if updated:
                     existing.scraped_at = datetime.utcnow()
                     updated_listings += 1
-                continue
+            else:
+                car = CarListing(
+                    source="Facebook Marketplace",
+                    title=title,
+                    make=make,
+                    model=model,
+                    year=year,
+                    price=price,
+                    kilometers=mileage,
+                    url=url,
+                    scraped_at=datetime.utcnow(),
+                    description=description,
+                )
+                session.add(car)
+                new_listings += 1
 
-            car = CarListing(
-                source="Facebook Marketplace",
-                title=title,
-                make=make,
-                model=model,
-                year=year,
-                price=price,
-                kilometers=mileage,
-                url=url,
-                scraped_at=datetime.utcnow(),
-                description=description
-            )
-            session.add(car)
-            new_listings += 1
 
         session.commit()
         await browser.close()

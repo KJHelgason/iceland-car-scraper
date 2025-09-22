@@ -1,0 +1,28 @@
+version: "3.9"
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///data/app.db}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ../data:/app/data
+      - pw_cache:/root/.cache/ms-playwright
+      # Uncomment to mount fb_state.json if you copy it onto host
+      # - ../fb_state.json:/app/fb_state.json:ro
+    # ports:
+    #   - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os; exit(0)'" ]
+      interval: 1m
+      timeout: 5s
+      retries: 2
+      start_period: 20s
+volumes:
+  pw_cache:

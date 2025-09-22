@@ -483,6 +483,189 @@ def prune_bilasolur_dead_listings_all(select_window: int = 500, commit_batch: in
     ))
 
 # ----------------------------
+# Bilaland: full sweep dead/inactive pruning
+# ----------------------------
+async def _prune_bilaland_dead_listings_all_async(
+    select_window: int = 500,
+    commit_batch: int = 100,
+    only_incomplete: bool = True,
+) -> int:
+    from playwright.async_api import async_playwright
+    from sqlalchemy import and_
+
+    session = SessionLocal()
+
+    def fetch_window(after_id: int | None):
+        conds = [CarListing.source == "Bilaland", CarListing.url.isnot(None)]
+        if after_id is not None:
+            conds.append(CarListing.id > after_id)
+
+        rows = (
+            session.execute(
+                select(CarListing.id, CarListing.url)
+                .where(and_(*conds))
+                .order_by(CarListing.id.asc())
+                .limit(select_window)
+            )
+            .all()
+        )
+        return rows
+
+    last_id = None
+    total_actions = 0
+    ops_since_commit = 0
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+
+        while True:
+            window = fetch_window(last_id)
+            if not window:
+                break
+
+            print(f"[Bilaland dead listings] Window after id={last_id or 0}, fetched={len(window)}")
+
+            for cid, url in window:
+                c = session.get(CarListing, cid)
+                if not c:
+                    last_id = cid
+                    continue
+
+                is_dead = False
+                try:
+                    await page.goto(url, timeout=25000)
+                    dead_node = await page.query_selector(
+                        "xpath=/html/body/form/div[3]/div[3]/div/div/div/text()"
+                    )
+                    dead_text = (await dead_node.inner_text()) if dead_node else ""
+                    if "Engar upplýsingar fundust um ökutæki" in dead_text:
+                        is_dead = True
+                except Exception:
+                    is_dead = True
+
+                if is_dead:
+                    if is_full_row(c):
+                        if c.is_active:
+                            c.is_active = False
+                            total_actions += 1
+                    else:
+                        session.delete(c)
+                        total_actions += 1
+                else:
+                    if hasattr(c, "is_active") and not c.is_active:
+                        c.is_active = True
+                        total_actions += 1
+
+                ops_since_commit += 1
+                if ops_since_commit >= commit_batch:
+                    try:
+                        session.commit()
+                        print("    [DB] Committed batch of updates/deletes.")
+                    except OperationalError as oe:
+                        print("    [DB] OperationalError on commit; refreshing session…", oe)
+                        session.rollback()
+                        session.close()
+                        session = SessionLocal()
+                    ops_since_commit = 0
+
+                last_id = cid
+
+        try:
+            session.commit()
+            print("    [DB] Final commit complete.")
+        except OperationalError as oe:
+            session.rollback()
+            session.close()
+            session = SessionLocal()
+            session.commit()
+
+        await page.close()
+        await browser.close()
+
+    session.close()
+    print(f"[Bilaland dead listings] Actions (inactive or deleted): {total_actions}")
+    return total_actions
+
+def prune_bilaland_dead_listings_all(
+    select_window: int = 500,
+    commit_batch: int = 100,
+    only_incomplete: bool = True
+) -> int:
+    return asyncio.run(_prune_bilaland_dead_listings_all_async(
+        select_window=select_window,
+        commit_batch=commit_batch,
+        only_incomplete=only_incomplete,
+    ))
+
+# ----------------------------
+# Facebook: validate active/inactive
+# ----------------------------
+async def _validate_facebook_listings_async(limit: int = 200) -> int:
+    from playwright.async_api import async_playwright
+
+    session = SessionLocal()
+    candidates = session.execute(
+        select(CarListing)
+        .where(CarListing.source == "Facebook Marketplace")
+        .where(CarListing.url.isnot(None))
+        .order_by(
+            nullslast(CarListing.scraped_at.desc()),
+            CarListing.id.desc()
+        )
+        .limit(limit)
+    ).scalars().all()
+    print(f"[Facebook validation] Checking {len(candidates)} listings...")
+
+    actions = 0
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        for c in candidates:
+            print(f"  - Visiting Facebook id={c.id}, url={c.url}")
+            is_dead = False
+            try:
+                await page.goto(c.url, timeout=20000)
+                html = await page.content()
+
+                # Facebook "no longer available" check
+                if "no longer available" in html.lower() or "not available" in html.lower():
+                    is_dead = True
+                elif "Marketplace" in (await page.title()) and "/marketplace/item/" not in page.url:
+                    is_dead = True
+
+            except Exception:
+                print("    [!] Timeout or navigation error.")
+                is_dead = True
+
+            if is_dead:
+                if is_full_row(c):
+                    if c.is_active:
+                        c.is_active = False
+                        actions += 1
+                        print("    [•] Marked inactive (kept full row).")
+                else:
+                    session.delete(c)
+                    actions += 1
+                    print("    [x] Deleted incomplete dead listing.")
+            else:
+                if hasattr(c, "is_active") and not c.is_active:
+                    c.is_active = True
+                    actions += 1
+                    print("    [+] Revived to active.")
+
+        session.commit()
+        await page.close()
+        await browser.close()
+    session.close()
+    print(f"[Facebook validation] Actions taken: {actions}")
+    return actions
+
+def validate_facebook_listings(limit: int = 200) -> int:
+    return asyncio.run(_validate_facebook_listings_async(limit=limit))
+
+# ----------------------------
 # Orchestrator
 # ----------------------------
 def run_all_cleaners():
@@ -505,19 +688,33 @@ def run_all_cleaners():
     finally:
         session.close()
 
-    # 4) Prune dead listings (choose one of the strategies)
+    # 4) Prune dead listings
 
-    # A) Quick recent window (e.g., run daily)
-    # dead_removed = prune_dead_listings(limit=300)
+    # A) Full Bilasólur sweep (keeps full rows and marks them inactive)
+    bilasolur_dead_actions = prune_bilasolur_dead_listings_all(
+        select_window=500,
+        commit_batch=100,
+        only_incomplete=True
+    )
 
-    # B) Full Bilasólur sweep (e.g., weekly) — keeps full rows and marks them inactive
-    dead_removed = prune_bilasolur_dead_listings_all(select_window=500, commit_batch=100, only_incomplete=True)
+    # B) Full Bilaland sweep (similar logic)
+    bilaland_dead_actions = prune_bilaland_dead_listings_all(
+        select_window=500,
+        commit_batch=100,
+        only_incomplete=True
+    )
+
+    # C) Facebook listings validation
+    fb_actions = validate_facebook_listings(limit=200)
 
     print("=== Cleaning summary ===")
     print(f"  - Non-cars removed: {removed_non_cars}")
     print(f"  - Bilasólur null price fixes/deletions: {fixed_or_deleted}")
     print(f"  - Duplicates removed: {removed_dups}")
-    print(f"  - Dead listings actions (inactive or deleted): {dead_removed}")
+    print(f"  - Bilasólur dead listings actions (inactive/deleted): {bilasolur_dead_actions}")
+    print(f"  - Bilaland dead listings actions (inactive/deleted): {bilaland_dead_actions}")
+    print(f"  - Facebook listings validated: {fb_actions}")
+
 
 if __name__ == "__main__":
     run_all_cleaners()

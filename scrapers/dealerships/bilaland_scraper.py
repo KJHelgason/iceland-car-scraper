@@ -4,9 +4,9 @@ from playwright.async_api import async_playwright
 from datetime import datetime
 from db.db_setup import SessionLocal
 from db.models import CarListing
-from utils.normalizer import normalize_make, normalize_model, normalize_title  # ✅
+from utils.normalizer import normalize_make, normalize_model, normalize_title  
 
-BASE_URL = "https://www.bilaland.is/SearchResults.aspx?id=f64d9165-4e5a-46fa-8db1-c83028b1f179"
+BASE_URL = "https://bilaland.is/"
 
 def extract_price(text: str):
     if not text:
@@ -51,6 +51,16 @@ async def scrape_bilaland(max_scrolls=5):
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         await page.goto(BASE_URL)
+        await page.wait_for_selector(".sr-item")
+
+        # ✅ Click the "Leita" button before scraping
+        try:
+            await page.click('xpath=/html/body/form/nav/div/div[4]/div/div/div/div/div/div[6]/div/input')
+            await asyncio.sleep(2)  # give results time to load
+        except Exception as e:
+            print(f"[WARN] Could not click Leita button: {e}")
+
+        # Wait for results to appear
         await page.wait_for_selector(".sr-item")
 
         print("Scrolling to load more listings...")
@@ -118,16 +128,24 @@ async def scrape_bilaland(max_scrolls=5):
                     kilometers = extract_kilometers(value)
 
             # Check if listing exists
-            existing = session.query(CarListing).filter_by(url=link).first()
+            existing = (
+                session.query(CarListing)
+                .filter_by(
+                    source="Bilaland",
+                    make=normalized_make,
+                    model=normalized_model,
+                    year=year,
+                    title=normalized_title,
+                )
+                .first()
+            )
+
             if existing:
                 updated = False
                 for field, value in {
                     "price": price,
-                    "title": normalized_title,
-                    "make": normalized_make,
-                    "model": normalized_model,
-                    "year": year,
                     "kilometers": kilometers,
+                    "url": link,  # URL might change, keep latest
                 }.items():
                     if value is not None and getattr(existing, field) != value:
                         setattr(existing, field, value)
@@ -135,22 +153,21 @@ async def scrape_bilaland(max_scrolls=5):
                 if updated:
                     existing.scraped_at = datetime.utcnow()
                     updated_listings += 1
-                continue
+            else:
+                car = CarListing(
+                    source="Bilaland",
+                    title=normalized_title,
+                    make=normalized_make,
+                    model=normalized_model,
+                    year=year,
+                    price=price,
+                    kilometers=kilometers,
+                    url=link,
+                    scraped_at=datetime.utcnow(),
+                )
+                session.add(car)
+                new_listings += 1
 
-            # Add new listing
-            car = CarListing(
-                source="Bilaland",
-                title=normalized_title,
-                make=normalized_make,
-                model=normalized_model,
-                year=year,
-                price=price,
-                kilometers=kilometers,
-                url=link,
-                scraped_at=datetime.utcnow()
-            )
-            session.add(car)
-            new_listings += 1
 
         session.commit()
         await browser.close()
