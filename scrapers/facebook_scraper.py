@@ -15,7 +15,8 @@ COOKIES_FILE = "fb_state.json"
 
 # Initialize Gemini
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-gemini_model = genai.GenerativeModel("gemini-2.5-pro")
+#gemini_model = genai.GenerativeModel("gemini-2.5-pro")
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
 # ----- Utilities -----
 def extract_number(text):
@@ -196,18 +197,27 @@ async def scrape_facebook(max_items=20):
                 continue
 
             # Upsert
-                        # Upsert by (source, make, model, year, title)
-            existing = (
-                session.query(CarListing)
-                .filter_by(
-                    source="Facebook Marketplace",
-                    make=make,
-                    model=model,
-                    year=year,
-                    title=title,
+            # Decide whether we can use structured uniqueness or fallback to URL
+            if all([make, model, year, title]):
+                # ✅ Preferred: Upsert by (source, make, model, year, title)
+                existing = (
+                    session.query(CarListing)
+                    .filter_by(
+                        source="Facebook Marketplace",
+                        make=make,
+                        model=model,
+                        year=year,
+                        title=title,
+                    )
+                    .first()
                 )
-                .first()
-            )
+            else:
+                # ⚠️ Fallback: Upsert by URL
+                existing = (
+                    session.query(CarListing)
+                    .filter_by(source="Facebook Marketplace", url=url)
+                    .first()
+                )
 
             if existing:
                 updated = False
@@ -215,7 +225,7 @@ async def scrape_facebook(max_items=20):
                     "price": price,
                     "kilometers": mileage,
                     "description": description,
-                    "url": url,  # ✅ allow updating URL since FB can rotate them
+                    "url": url,  # ✅ keep URL fresh since FB rotates
                 }.items():
                     if value is not None and getattr(existing, field) != value:
                         setattr(existing, field, value)

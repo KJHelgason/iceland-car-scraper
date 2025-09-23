@@ -28,6 +28,9 @@ from scrapers.dealerships.bilasolur_seed_links import discover_bilasolur_links  
 from db.reference_price_updater import update_reference_prices
 from deal_checker import check_for_deals
 from normalize_existing_data import normalize_all
+from cleaners.clean_data import run_all_cleaners as clean_data
+from analysis.update_daily_deals import update_daily_deals
+from analysis.train_price_models_3 import train_and_store as train_price_models
 
 app = typer.Typer(help="Car scraper automation CLI")
 
@@ -52,6 +55,21 @@ def cmd_scrape_bilasolur_discover(max_pages: int = typer.Option(500, help="Max p
     urls = asyncio.run(discover_bilasolur_links())
     typer.echo(f"Discovered {len(urls)} seed URLs")
     asyncio.run(scrape_bilasolur(start_urls=urls, max_pages=max_pages))
+
+@app.command("clean-data")
+def cmd_clean_data():
+    """Run the daily data cleaning process."""
+    clean_data()
+
+@app.command("rebuild-deals")
+def cmd_rebuild_daily_deals():
+    """Rebuild the daily deals table."""
+    update_daily_deals()
+
+@app.command("train-models")
+def cmd_train_price_models():
+    """Train price prediction models."""
+    train_price_models()
 
 @app.command("update-refs")
 def cmd_update_refs():
