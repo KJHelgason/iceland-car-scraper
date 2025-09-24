@@ -1,6 +1,6 @@
 # Container image for automated scraping scheduler
 # Using official Playwright image for all browser dependencies
-FROM mcr.microsoft.com/playwright/python:latest
+FROM mcr.microsoft.com/playwright/python:v1.54.0-jammy
 
 WORKDIR /app
 

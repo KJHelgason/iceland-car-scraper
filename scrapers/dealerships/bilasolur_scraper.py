@@ -195,24 +195,32 @@ async def scrape_bilasolur(max_pages: int = 3, start_urls: list[str] | None = No
                             kilometers = extract_kilometers(tech_text)
 
                 # Upsert
-                existing = (
-                    session.query(CarListing)
-                    .filter_by(
-                        source="Bilasolur",
-                        make=normalized_make,
-                        model=normalized_model,
-                        year=year,
-                        title=normalized_title,
+                existing = session.query(CarListing).filter_by(url=link).first()
+
+                if not existing:
+                    # fallback: same car but new URL
+                    existing = (
+                        session.query(CarListing)
+                        .filter_by(
+                            source="Bilasolur",
+                            make=normalized_make,
+                            model=normalized_model,
+                            year=year,
+                            title=normalized_title,
+                        )
+                        .first()
                     )
-                    .first()
-                )
 
                 if existing:
                     updated = False
                     for field, value in {
                         "price": price,
                         "kilometers": kilometers,
-                        "url": link,  # URL can change, keep the latest
+                        "title": normalized_title,
+                        "make": normalized_make,
+                        "model": normalized_model,
+                        "year": year,
+                        "url": link,  # update URL if it changed
                     }.items():
                         if value is not None and getattr(existing, field) != value:
                             setattr(existing, field, value)

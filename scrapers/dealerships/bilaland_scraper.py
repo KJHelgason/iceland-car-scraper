@@ -127,25 +127,33 @@ async def scrape_bilaland(max_scrolls=5):
                 if "akstur" in label and "nýtt" not in value.lower():
                     kilometers = extract_kilometers(value)
 
-            # Check if listing exists
-            existing = (
-                session.query(CarListing)
-                .filter_by(
-                    source="Bilaland",
-                    make=normalized_make,
-                    model=normalized_model,
-                    year=year,
-                    title=normalized_title,
+            # --- Upsert -------------------------------------------------
+            existing = session.query(CarListing).filter_by(url=link).first()
+
+            if not existing:
+                # fallback: same car but new URL
+                existing = (
+                    session.query(CarListing)
+                    .filter_by(
+                        source="Bilaland",
+                        make=normalized_make,
+                        model=normalized_model,
+                        year=year,
+                        title=normalized_title,
+                    )
+                    .first()
                 )
-                .first()
-            )
 
             if existing:
                 updated = False
                 for field, value in {
                     "price": price,
                     "kilometers": kilometers,
-                    "url": link,  # URL might change, keep latest
+                    "title": normalized_title,
+                    "make": normalized_make,
+                    "model": normalized_model,
+                    "year": year,
+                    "url": link,  # update URL if it changed
                 }.items():
                     if value is not None and getattr(existing, field) != value:
                         setattr(existing, field, value)
@@ -167,6 +175,7 @@ async def scrape_bilaland(max_scrolls=5):
                 )
                 session.add(car)
                 new_listings += 1
+
 
 
         session.commit()
