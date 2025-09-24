@@ -119,7 +119,7 @@ async def scrape_facebook(max_items=20):
     updated_listings = 0
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(storage_state=COOKIES_FILE if os.path.exists(COOKIES_FILE) else None)
         await ensure_facebook_login(context)
         page = await context.new_page()
