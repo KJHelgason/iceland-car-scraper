@@ -16,7 +16,7 @@ COOKIES_FILE = "fb_state.json"
 # Initialize Gemini
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 #gemini_model = genai.GenerativeModel("gemini-2.5-pro")
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
 # ----- Utilities -----
 def extract_number(text):
