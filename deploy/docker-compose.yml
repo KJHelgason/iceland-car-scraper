@@ -5,7 +5,7 @@ services:
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
     env_file:
-      - ../.env
+      - /home/kjartan/iceland-car-scraper/.env
     environment:
       - DATABASE_URL=${DATABASE_URL}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
