@@ -4,7 +4,7 @@ from playwright.async_api import async_playwright
 from datetime import datetime
 from db.db_setup import SessionLocal
 from db.models import CarListing
-from utils.normalizer import normalize_make, normalize_model, normalize_title  
+from utils.normalizer import normalize_make, normalize_model, normalize_title, pretty_make, get_display_name  
 
 BASE_URL = "https://bilaland.is/"
 
@@ -42,7 +42,7 @@ def extract_kilometers(text: str):
 
     return None
 
-async def scrape_bilaland(max_scrolls=5):
+async def scrape_bilaland(max_scrolls=5, start_url=None):
     session = SessionLocal()
     new_listings = 0
     updated_listings = 0
@@ -50,15 +50,19 @@ async def scrape_bilaland(max_scrolls=5):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-        await page.goto(BASE_URL)
+        
+        # Use provided start_url or default BASE_URL
+        url_to_visit = start_url if start_url else BASE_URL
+        await page.goto(url_to_visit)
         await page.wait_for_selector(".sr-item")
 
-        # ✅ Click the "Leita" button before scraping
-        try:
-            await page.click('xpath=/html/body/form/nav/div/div[4]/div/div/div/div/div/div[6]/div/input')
-            await asyncio.sleep(2)  # give results time to load
-        except Exception as e:
-            print(f"[WARN] Could not click Leita button: {e}")
+        # Only click Leita if we're starting from BASE_URL (not from a discovered search URL)
+        if not start_url:
+            try:
+                await page.click('xpath=/html/body/form/nav/div/div[4]/div/div/div/div/div/div[6]/div/input')
+                await asyncio.sleep(2)  # give results time to load
+            except Exception as e:
+                print(f"[WARN] Could not click Leita button: {e}")
 
         # Wait for results to appear
         await page.wait_for_selector(".sr-item")
@@ -95,6 +99,17 @@ async def scrape_bilaland(max_scrolls=5):
                 link = f"https://www.bilaland.is/{link.lstrip('/')}"
             if not link:
                 continue
+
+            # Image URL
+            image_url = None
+            img_el = await item.query_selector("figure img, .sr-item img")
+            if img_el:
+                img_src = await img_el.get_attribute("src")
+                if img_src:
+                    if not img_src.startswith("http"):
+                        image_url = f"https://www.bilaland.is/{img_src.lstrip('/')}"
+                    else:
+                        image_url = img_src
 
             # Price
             price = None
@@ -158,6 +173,12 @@ async def scrape_bilaland(max_scrolls=5):
                     if value is not None and getattr(existing, field) != value:
                         setattr(existing, field, value)
                         updated = True
+                
+                # Always update image_url if we have one and DB doesn't (or it's different)
+                if image_url and existing.image_url != image_url:
+                    existing.image_url = image_url
+                    updated = True
+                
                 if updated:
                     existing.scraped_at = datetime.utcnow()
                     updated_listings += 1
@@ -171,6 +192,9 @@ async def scrape_bilaland(max_scrolls=5):
                     price=price,
                     kilometers=kilometers,
                     url=link,
+                    image_url=image_url,
+                    display_make=pretty_make(normalized_make) if normalized_make else None,
+                    display_name=get_display_name(normalized_model) if normalized_model else None,
                     scraped_at=datetime.utcnow(),
                 )
                 session.add(car)

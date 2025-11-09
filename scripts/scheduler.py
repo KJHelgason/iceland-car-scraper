@@ -1,13 +1,23 @@
 """Async scheduler for recurring scraping and processing jobs.
 Run: python scripts/scheduler.py
 Jobs:
-  - Bilaland cycle every 6 hours
-  - Bilasölur cycle every 6 hours
-  - Facebook cycle every 3 hours
-  - Bilasölur discovery daily at 02:30 UTC
-  - Clean data daily at 02:00 UTC
-  - Rebuild daily deals daily at 03:00 UTC
-  - Train price prediction models daily at 04:00 UTC
+  - Daily scraping sequence starting at midnight (runs sequentially, each waits for previous):
+    - 00:00: Start sequence
+      1. Bilasölur (largest scraper)
+      2. Bilaland
+      3. Hekla
+      4. Brimborg
+      5. BR
+      6. Íslandsbílar
+      7. Facebook discovery
+  - Facebook: Scrape 10 listings every 2 hours throughout the day
+  - Maintenance (fixed times after scraping expected to complete):
+    - 12:00 (check oldest listings - daily sample)
+    - 13:00 (delete incomplete)
+    - 14:00 (rebuild deals)
+    - 16:00 (clean data)
+    - 18:00 (train price models)
+    - 20:00 (comprehensive check of ALL active listings - DAILY)
 Environment:
   LOG_LEVEL, TZ, GOOGLE_API_KEY, DATABASE_URL
 """
@@ -36,9 +46,18 @@ logging.basicConfig(
 log = logging.getLogger("scheduler")
 
 from scrapers.facebook_scraper import scrape_facebook
+from scrapers.facebook_seed_links import discover_facebook_links
 from scrapers.dealerships.bilaland_scraper import scrape_bilaland
+from scrapers.dealerships.bilaland_seed_links import discover_bilaland_links
 from scrapers.dealerships.bilasolur_scraper import scrape_bilasolur
 from scrapers.dealerships.bilasolur_seed_links import discover_bilasolur_links
+from scrapers.dealerships.islandsbilar_scraper import scrape_islandsbilar
+from scrapers.dealerships.hekla_scraper import scrape_hekla
+from scrapers.dealerships.hekla_seed_links import discover_hekla_links
+from scrapers.dealerships.brimborg_scraper import scrape_brimborg
+from scrapers.dealerships.brimborg_seed_links import discover_brimborg_links
+from scrapers.dealerships.br_scraper import scrape_br
+from scrapers.dealerships.br_seed_links import discover_br_links
 from db.reference_price_updater import update_reference_prices
 from deal_checker import check_for_deals
 
@@ -46,37 +65,150 @@ from deal_checker import check_for_deals
 from cleaners.clean_data import run_all_cleaners as clean_data
 from analysis.update_daily_deals import update_daily_deals
 from analysis.train_price_models_3 import train_and_store as train_price_models
+from check_oldest_listings import check_oldest_listings
+from delete_incomplete_listings import delete_incomplete_listings
+from check_all_active_listings import check_all_active_listings
 
 # ---- Job definitions ----
-async def job_bilaland_cycle():
-    log.info("Starting Bilaland cycle")
-    await scrape_bilaland(max_scrolls=5)
+
+# Facebook: Global seed URLs variable
+facebook_seed_urls = []
+
+async def job_sequential_scraping():
+    """
+    Run all scrapers sequentially starting at midnight.
+    Each scraper waits for the previous one to complete.
+    """
+    log.info("="*70)
+    log.info("Starting sequential daily scraping sequence")
+    log.info("="*70)
+    
+    # 1. Bilasölur (largest, runs first)
+    try:
+        log.info("[1/7] Starting Bilasölur scrape")
+        urls = await discover_bilasolur_links()
+        log.info(f"Discovered {len(urls)} Bilasölur seed URLs")
+        for idx, url in enumerate(urls, 1):
+            log.info(f"Scraping Bilasölur URL {idx}/{len(urls)}")
+            await scrape_bilasolur(max_scrolls=50, start_url=url)
+        update_reference_prices()
+        check_for_deals()
+        log.info("✓ Bilasölur complete")
+    except Exception as e:
+        log.error(f"✗ Bilasölur failed: {e}", exc_info=True)
+    
+    # 2. Bilaland
+    try:
+        log.info("[2/7] Starting Bilaland scrape")
+        urls = await discover_bilaland_links()
+        log.info(f"Discovered {len(urls)} Bilaland seed URLs")
+        for idx, url in enumerate(urls, 1):
+            log.info(f"Scraping Bilaland URL {idx}/{len(urls)}")
+            await scrape_bilaland(max_scrolls=10, start_url=url)
+        update_reference_prices()
+        check_for_deals()
+        log.info("✓ Bilaland complete")
+    except Exception as e:
+        log.error(f"✗ Bilaland failed: {e}", exc_info=True)
+    
+    # 3. Hekla
+    try:
+        log.info("[3/7] Starting Hekla scrape")
+        urls = await discover_hekla_links()
+        log.info(f"Discovered {len(urls)} Hekla seed URLs")
+        for idx, url in enumerate(urls, 1):
+            log.info(f"Scraping Hekla URL {idx}/{len(urls)}")
+            await scrape_hekla(max_pages=10, start_url=url)
+        update_reference_prices()
+        check_for_deals()
+        log.info("✓ Hekla complete")
+    except Exception as e:
+        log.error(f"✗ Hekla failed: {e}", exc_info=True)
+    
+    # 4. Brimborg
+    try:
+        log.info("[4/7] Starting Brimborg scrape")
+        urls = await discover_brimborg_links()
+        log.info(f"Discovered {len(urls)} Brimborg seed URLs")
+        for idx, url in enumerate(urls, 1):
+            log.info(f"Scraping Brimborg URL {idx}/{len(urls)}")
+            await scrape_brimborg(max_pages=10, start_url=url)
+        update_reference_prices()
+        check_for_deals()
+        log.info("✓ Brimborg complete")
+    except Exception as e:
+        log.error(f"✗ Brimborg failed: {e}", exc_info=True)
+    
+    # 5. BR
+    try:
+        log.info("[5/7] Starting BR scrape")
+        urls = await discover_br_links()
+        log.info(f"Discovered {len(urls)} BR seed URLs")
+        for idx, url in enumerate(urls, 1):
+            log.info(f"Scraping BR URL {idx}/{len(urls)}")
+            await scrape_br(max_scrolls=20, start_url=url)
+        update_reference_prices()
+        check_for_deals()
+        log.info("✓ BR complete")
+    except Exception as e:
+        log.error(f"✗ BR failed: {e}", exc_info=True)
+    
+    # 6. Íslandsbílar
+    try:
+        log.info("[6/7] Starting Íslandsbílar scrape")
+        await scrape_islandsbilar(max_pages=50)
+        update_reference_prices()
+        check_for_deals()
+        log.info("✓ Íslandsbílar complete")
+    except Exception as e:
+        log.error(f"✗ Íslandsbílar failed: {e}", exc_info=True)
+    
+    # 7. Facebook URL discovery
+    global facebook_seed_urls
+    try:
+        log.info("[7/7] Starting Facebook URL discovery")
+        facebook_seed_urls = await discover_facebook_links(max_scrolls=50)
+        log.info(f"✓ Facebook discovery complete: {len(facebook_seed_urls)} URLs")
+    except Exception as e:
+        log.error(f"✗ Facebook discovery failed: {e}", exc_info=True)
+    
+    log.info("="*70)
+    log.info("Sequential scraping sequence complete")
+    log.info("="*70)
+
+async def job_facebook_scrape_batch():
+    """
+    Scrape Facebook listings from discovered URLs in batches.
+    Runs hourly, processing 10 listings at a time.
+    """
+    global facebook_seed_urls
+    if not facebook_seed_urls:
+        log.warning("No Facebook seed URLs available. Skipping batch scrape.")
+        return
+    
+    log.info(f"Starting Facebook batch scrape (10 listings from {len(facebook_seed_urls)} total)")
+    await scrape_facebook(max_items=10, start_urls=facebook_seed_urls)
     update_reference_prices()
     check_for_deals()
-    log.info("Finished Bilaland cycle")
-
-async def job_bilasolur_cycle():
-    log.info("Starting Bilasölur cycle")
-    await scrape_bilasolur(max_pages=100)
-    update_reference_prices()
-    check_for_deals()
-    log.info("Finished Bilasölur cycle")
-
-async def job_fb_cycle():
-    log.info("Starting Facebook cycle")
-    await scrape_facebook(max_items=10)
-    update_reference_prices()
-    check_for_deals()
-    log.info("Finished Facebook cycle")
-
-async def job_bilasolur_discover_and_scrape():
-    log.info("Starting Bilasölur discovery")
-    urls = await discover_bilasolur_links()
-    log.info("Discovered %d seed URLs", len(urls))
-    await scrape_bilasolur(start_urls=urls, max_pages=500)
-    log.info("Finished Bilasölur discovery+scrape")
+    log.info("Finished Facebook batch scrape")
 
 # ---- Maintenance job wrappers ----
+async def job_check_oldest_listings():
+    log.info("Starting check of oldest active listings")
+    await check_oldest_listings(limit_per_source=100)
+    log.info("Finished checking oldest active listings")
+
+async def job_check_all_active_listings():
+    """Comprehensive check of ALL active listings (runs weekly)."""
+    log.info("Starting comprehensive check of all active listings")
+    await check_all_active_listings(limit_per_source=None, batch_size=50)
+    log.info("Finished comprehensive check of all active listings")
+
+async def job_delete_incomplete_listings():
+    log.info("Starting deletion of incomplete inactive listings")
+    await delete_incomplete_listings(batch_size=100)
+    log.info("Finished deleting incomplete inactive listings")
+
 async def job_clean_data():
     log.info("Starting daily data cleaning")
     await asyncio.to_thread(clean_data)
@@ -97,24 +229,35 @@ def main():
     tz = os.getenv("TZ", "UTC")
     sched = AsyncIOScheduler(timezone=tz)
 
-    # ---- Register jobs with staggered minutes ----
-    sched.add_job(job_bilaland_cycle, CronTrigger(hour="*/6", minute=0), id="bilaland")           # every 6h at :00
-    sched.add_job(job_bilasolur_cycle, CronTrigger(hour="*/6", minute=5), id="bilasolar")        # every 6h at :05
-    sched.add_job(job_fb_cycle, CronTrigger(hour="*/3", minute=10), id="facebook")               # every 3h at :10
+    # ---- Daily sequential scraping (starts at midnight) ----
+    # All scrapers run in sequence: Bilasolur → Bilaland → Hekla → Brimborg → BR → Islandsbilar → Facebook Discovery
+    sched.add_job(job_sequential_scraping, CronTrigger(hour=0, minute=0), id="sequential_scraping")
+    
+    # ---- Facebook batch scraping (hourly throughout the day) ----
+    # Scrapes 10 listings per hour from discovered URLs
+    sched.add_job(job_facebook_scrape_batch, CronTrigger(hour="*/2", minute=15), id="facebook_batch")  # Every 2 hours at :15
 
-    # Daily jobs (already staggered by hour)
-    sched.add_job(job_bilasolur_discover_and_scrape,
-                  CronTrigger(hour=2, minute=30),
-                  id="bilasolar_discover")
+    # ---- Daily maintenance jobs (afternoon/evening when scraping is done) ----
+    sched.add_job(job_check_oldest_listings,
+                  CronTrigger(hour=12, minute=0),
+                  id="check_oldest")
+    sched.add_job(job_delete_incomplete_listings,
+                  CronTrigger(hour=13, minute=0),
+                  id="delete_incomplete")
     sched.add_job(job_rebuild_daily_deals,
-                  CronTrigger(hour=3, minute=0),
+                  CronTrigger(hour=14, minute=0),
                   id="rebuild_deals")
     sched.add_job(job_clean_data,
-                  CronTrigger(hour=4, minute=0),
+                  CronTrigger(hour=16, minute=0),
                   id="clean_data")
     sched.add_job(job_train_price_models,
-                  CronTrigger(hour=5, minute=0),
+                  CronTrigger(hour=18, minute=0),
                   id="train_price_models")
+    
+    # ---- Comprehensive active listings check (daily at 20:00, after scraping and training) ----
+    sched.add_job(job_check_all_active_listings,
+                  CronTrigger(hour=20, minute=0),
+                  id="check_all_active_daily")
 
     # ---- Runner ----
     async def runner():

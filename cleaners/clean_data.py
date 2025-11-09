@@ -10,6 +10,7 @@ from sqlalchemy.exc import OperationalError  # <-- for resilient commits
 from db.db_setup import SessionLocal
 from db.models import CarListing
 from utils.normalizer import normalize_make
+from utils.s3_cleanup import delete_s3_image
 
 # ----------------------------
 # Whitelist of known car makes
@@ -78,32 +79,43 @@ def should_delete_as_non_car(make: Optional[str]) -> bool:
 # ----------------------------
 # Duplicate removal
 # ----------------------------
+# Cross-source duplicate detection:
+# - Group by: make, model, year, price, km (NOT source)
+# - Preference order when choosing which to keep:
+#   1. Non-Bilasolur sources (dealer direct is more authoritative)
+#   2. Newest scraped_at (most recent data)
+#   3. Highest ID (tiebreaker)
+# ----------------------------
 def remove_exact_duplicates(session: Session) -> int:
-    print("[Duplicates] Checking for duplicates...")
+    print("[Duplicates] Checking for cross-source duplicates...")
     rows = session.execute(
         select(
             CarListing.make, CarListing.model, CarListing.year,
-            CarListing.price, CarListing.kilometers, CarListing.source,
+            CarListing.price, CarListing.kilometers,
             func.count(CarListing.id)
         ).group_by(
             CarListing.make, CarListing.model, CarListing.year,
-            CarListing.price, CarListing.kilometers, CarListing.source
+            CarListing.price, CarListing.kilometers
         ).having(func.count(CarListing.id) > 1)
     ).all()
 
-    print(f"[Duplicates] Found {len(rows)} duplicate groups.")
+    print(f"[Duplicates] Found {len(rows)} duplicate groups (cross-source).")
     deleted = 0
-    for (make, model, year, price, km, source, cnt) in rows:
-        print(f"  - Processing dup group: {make} {model} {year}, {price} ISK, {km} km, source={source}, count={cnt}")
+    for (make, model, year, price, km, cnt) in rows:
+        print(f"  - Processing dup group: {make} {model} {year}, {price} ISK, {km} km, count={cnt}")
         dups = session.execute(
             select(CarListing).where(
                 CarListing.make == make,
                 CarListing.model == model,
                 CarListing.year == year,
                 CarListing.price == price,
-                CarListing.kilometers == km,
-                CarListing.source == source
+                CarListing.kilometers == km
             ).order_by(
+                # Prefer non-Bilasolur sources first
+                # In SQL, FALSE (0) sorts before TRUE (1) in ASC order
+                # So we want "source != 'Bilasolur'" to be TRUE (1) for non-Bilasolur, FALSE (0) for Bilasolur
+                # Then sort descending to put TRUE (non-Bilasolur) first
+                desc(CarListing.source != 'Bilasolur'),
                 nullslast(CarListing.scraped_at.desc()),
                 CarListing.id.desc()
             )
@@ -111,13 +123,100 @@ def remove_exact_duplicates(session: Session) -> int:
 
         keep = dups[0]
         to_delete = dups[1:]
+        
+        if to_delete:
+            print(f"    ✓ Keeping: {keep.source} id={keep.id}")
+        
         for row in to_delete:
+            # Delete S3 image if exists
+            if row.image_url:
+                delete_s3_image(row.image_url)
             session.delete(row)
             deleted += 1
-            print(f"    [x] Deleted duplicate id={row.id}, url={row.url}")
+            print(f"    ✗ Deleted: {row.source} id={row.id}, url={row.url[:60]}...")
+    
     session.commit()
-    print(f"[Duplicates] Removed {deleted} exact duplicates.")
+    print(f"[Duplicates] Removed {deleted} exact duplicates (preferring non-Bilasolur sources).")
     return deleted
+
+
+# ----------------------------
+# Bilasölur cid duplicate removal
+# ----------------------------
+def extract_car_id(url: str) -> Optional[str]:
+    """Extract the unique car ID (cid) from Bilasölur URLs."""
+    if not url:
+        return None
+    match = re.search(r'[?&]cid=(\d+)', url)
+    return match.group(1) if match else None
+
+
+def remove_bilasolur_cid_duplicates(session: Session) -> int:
+    """
+    Remove duplicate Bilasölur listings with the same cid (car ID).
+    Bilasölur URLs have dynamic params (schid, schpage) that change,
+    but cid is the true unique identifier.
+    """
+    from collections import defaultdict
+    
+    print("[Bilasölur cid] Checking for Bilasölur duplicates by car ID...")
+    
+    # Get all active Bilasölur listings
+    listings = session.execute(
+        select(CarListing).where(
+            CarListing.source == "Bilasolur",
+            CarListing.is_active == True
+        )
+    ).scalars().all()
+    
+    print(f"[Bilasölur cid] Checking {len(listings)} active Bilasölur listings...")
+    
+    # Group by cid
+    by_cid = defaultdict(list)
+    
+    for listing in listings:
+        cid = extract_car_id(listing.url)
+        if cid:
+            by_cid[cid].append(listing)
+    
+    print(f"[Bilasölur cid] Found {len(by_cid)} unique car IDs")
+    
+    # Find duplicates (cids with multiple listings)
+    duplicates = {cid: listings for cid, listings in by_cid.items() if len(listings) > 1}
+    
+    if not duplicates:
+        print("[Bilasölur cid] No duplicates found!")
+        return 0
+    
+    print(f"[Bilasölur cid] Found {len(duplicates)} car IDs with duplicates")
+    
+    total_deleted = 0
+    
+    for cid, dup_listings in duplicates.items():
+        # Sort by scraped_at (most recent first), then by ID (highest first)
+        sorted_listings = sorted(
+            dup_listings,
+            key=lambda x: (x.scraped_at if x.scraped_at else datetime.min, x.id),
+            reverse=True
+        )
+        
+        # Keep the first one (most recent)
+        keep = sorted_listings[0]
+        to_delete = sorted_listings[1:]
+        
+        print(f"  cid={cid}: Keeping id={keep.id}, deleting {len(to_delete)} duplicates")
+        
+        for listing in to_delete:
+            # Delete S3 image if exists
+            if listing.image_url:
+                delete_s3_image(listing.image_url)
+            session.delete(listing)
+            total_deleted += 1
+    
+    session.commit()
+    print(f"[Bilasölur cid] Removed {total_deleted} duplicate Bilasölur listings")
+    return total_deleted
+
 
 # ----------------------------
 # Non-car removal
@@ -133,6 +232,9 @@ def remove_non_cars(session: Session) -> int:
     for c in candidates:
         if should_delete_as_non_car(c.make):
             print(f"  [x] Removing non-car listing id={c.id}, make={c.make}, url={c.url}")
+            # Delete S3 image if exists
+            if c.image_url:
+                delete_s3_image(c.image_url)
             session.delete(c)
             removed += 1
     session.commit()
@@ -144,9 +246,10 @@ def remove_non_cars(session: Session) -> int:
 # ----------------------------
 async def _fix_bilasolur_null_prices_async() -> int:
     """
-    Visit each Bilasólur row with null price; update if price found; otherwise delete
-    if the row is still incomplete. Commits in batches to avoid huge transactions
-    and recovers from transient DB connection drops.
+    Visit each Bilasolur row with null price and try to update it.
+    If we can't fill in the missing data, delete the incomplete listing (no value without the data).
+    Complete listings are kept for ML even if marked inactive.
+    Commits in batches to avoid huge transactions and recovers from transient DB connection drops.
     """
     from playwright.async_api import async_playwright
 
@@ -200,10 +303,14 @@ async def _fix_bilasolur_null_prices_async() -> int:
                 await page.goto(url, timeout=30000)
             except Exception as e:
                 print(f"    [!] Failed to load page: {e}")
+                # Can't fill in data if page won't load - delete if incomplete
                 if not is_full_row(c):
-                    print("    [x] Deleted row (dead + incomplete).")
-                    session.delete(c); deleted += 1
-                    ops_since_commit += 1
+                    print("    [x] Deleted row (can't load + incomplete).")
+                    if c.image_url:
+                        delete_s3_image(c.image_url)
+                    session.delete(c)
+                    deleted += 1
+                ops_since_commit += 1
                 # Batch commit guard
                 if ops_since_commit >= BATCH_SIZE:
                     try:
@@ -241,9 +348,13 @@ async def _fix_bilasolur_null_prices_async() -> int:
                 fixed += 1
                 print(f"    [+] Updated id={c.id} price to {price_val} ISK")
             else:
+                # Can't fill in the price - delete if incomplete (no value without the data)
                 if not is_full_row(c):
                     print("    [x] Deleted row (still null price + incomplete).")
-                    session.delete(c); deleted += 1
+                    if c.image_url:
+                        delete_s3_image(c.image_url)
+                    session.delete(c)
+                    deleted += 1
                 # else keep complete row for modeling even if currently no price on page
 
             ops_since_commit += 1
@@ -338,6 +449,8 @@ async def _prune_dead_listings_async(limit: int = 200) -> int:
                         c.is_active = False
                         print("    [•] Marked dead (kept for modeling).")
                 else:
+                    if c.image_url:
+                        delete_s3_image(c.image_url)
                     session.delete(c)
                     removed += 1
                     print("    [x] Deleted incomplete dead listing.")
@@ -435,6 +548,8 @@ async def _prune_bilasolur_dead_listings_all_async(
                             total_actions += 1
                     else:
                         # delete only incomplete rows
+                        if c.image_url:
+                            delete_s3_image(c.image_url)
                         session.delete(c)
                         total_actions += 1
                 else:
@@ -550,6 +665,8 @@ async def _prune_bilaland_dead_listings_all_async(
                             c.is_active = False
                             total_actions += 1
                     else:
+                        if c.image_url:
+                            delete_s3_image(c.image_url)
                         session.delete(c)
                         total_actions += 1
                 else:
@@ -646,6 +763,8 @@ async def _validate_facebook_listings_async(limit: int = 200) -> int:
                         actions += 1
                         print("    [•] Marked inactive (kept full row).")
                 else:
+                    if c.image_url:
+                        delete_s3_image(c.image_url)
                     session.delete(c)
                     actions += 1
                     print("    [x] Deleted incomplete dead listing.")
@@ -678,42 +797,38 @@ def run_all_cleaners():
     finally:
         session.close()
 
-    # 2) Fix Bilasólur null prices (update if price exists, delete if dead+incomplete)
+    # 2) Fix Bilasolur null prices (update if price found, delete if incomplete and can't fill)
     fixed_or_deleted = fix_bilasolur_null_prices()
 
-    # 3) Now that prices are filled where possible, remove exact duplicates
+    # 3) Remove Bilasölur cid duplicates (same car with different URL params)
     session = SessionLocal()
     try:
-        removed_dups = remove_exact_duplicates(session)
+        removed_bilasolur_dups = remove_bilasolur_cid_duplicates(session)
     finally:
         session.close()
 
-    # 4) Prune dead listings
+    # 4) Remove cross-source duplicates (Bilasölur copies of dealership listings)
+    from cleaners.clean_cross_source_duplicates import remove_cross_source_duplicates
+    removed_cross_source_dups = remove_cross_source_duplicates()
 
-    # A) Full Bilasólur sweep (keeps full rows and marks them inactive)
-    bilasolur_dead_actions = prune_bilasolur_dead_listings_all(
-        select_window=500,
-        commit_batch=100,
-        only_incomplete=True
-    )
+    # 5) Now that prices are filled where possible, remove exact cross-source duplicates
+    session = SessionLocal()
+    try:
+        removed_exact_dups = remove_exact_duplicates(session)
+    finally:
+        session.close()
 
-    # B) Full Bilaland sweep (similar logic)
-    bilaland_dead_actions = prune_bilaland_dead_listings_all(
-        select_window=500,
-        commit_batch=100,
-        only_incomplete=True
-    )
-
-    # C) Facebook listings validation
-    fb_actions = validate_facebook_listings(limit=200)
+    # Note: Dead listing detection moved to check_oldest_listings.py (runs daily at 12:00)
+    # Incomplete inactive listing deletion moved to delete_incomplete_listings.py (runs daily at 13:00)
 
     print("=== Cleaning summary ===")
     print(f"  - Non-cars removed: {removed_non_cars}")
-    print(f"  - Bilasólur null price fixes/deletions: {fixed_or_deleted}")
-    print(f"  - Duplicates removed: {removed_dups}")
-    print(f"  - Bilasólur dead listings actions (inactive/deleted): {bilasolur_dead_actions}")
-    print(f"  - Bilaland dead listings actions (inactive/deleted): {bilaland_dead_actions}")
-    print(f"  - Facebook listings validated: {fb_actions}")
+    print(f"  - Bilasolur null price fixes/deletions: {fixed_or_deleted}")
+    print(f"  - Bilasolur cid duplicates removed: {removed_bilasolur_dups}")
+    print(f"  - Cross-source duplicates removed (Bilasölur copies): {removed_cross_source_dups}")
+    print(f"  - Exact duplicates removed: {removed_exact_dups}")
+    print(f"  - Note: Dead listing detection now handled by check_oldest_listings (12:00)")
+    print(f"  - Note: Incomplete inactive deletion now handled by delete_incomplete_listings (13:00)")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
+from sqlalchemy import func as sql_func
 
 from db.db_setup import SessionLocal
 from db.models import CarListing, PriceModel, DailyDeal
@@ -14,6 +15,7 @@ from utils.normalizer import normalize_make_model  # uses your trained buckets
 # -------- Config ----------
 TOP_N = 10
 MIN_PRICE = 50_000
+MIN_COMPARABLE_CARS = 10  # Minimum cars with same make/model/year for deal consideration
 LOOKBACK_HOURS = 24      # primary window (matches your UI default)
 EXTENDED_DAYS = 7        # extended fallback
 CHEAPEST_MULTIPLIER = 3  # fetch more than needed before ranking
@@ -176,6 +178,34 @@ def _load_price_models(session: Session) -> ModelIndex:
     return ModelIndex(pms)
 
 
+def _has_enough_comparables(
+    session: Session,
+    make: str,
+    model: str,
+    year: Optional[int],
+    min_count: int = MIN_COMPARABLE_CARS
+) -> bool:
+    """
+    Check if there are at least min_count cars with the same make, model, and year.
+    Returns True if enough comparable cars exist, False otherwise.
+    """
+    if not make or not model or year is None:
+        return False
+    
+    count = session.execute(
+        select(sql_func.count(CarListing.id))
+        .where(
+            CarListing.make == make,
+            CarListing.model == model,
+            CarListing.year == year,
+            CarListing.price.isnot(None),
+            CarListing.kilometers.isnot(None)
+        )
+    ).scalar()
+    
+    return (count or 0) >= min_count
+
+
 def update_daily_deals(
     top_n: int = TOP_N,
     lookback_hours: int = LOOKBACK_HOURS,
@@ -222,19 +252,58 @@ def update_daily_deals(
 
         deduped = list(best_by_id.values())
 
-        # STRICT VALIDATION: require fully present fields
-        valid = []
+        # STRICT VALIDATION: require fully present fields + count comparable cars
+        valid_with_comparables = []
+        valid_without_comparables = []
+        filtered_insufficient_comparables = 0
+        
         for d in deduped:
             r: CarListing = d["row"]
             if not (r.make and r.model):
                 continue
             if r.year is None or r.kilometers is None or r.price is None:
                 continue
-            valid.append(d)
+            
+            # Count comparable cars with same make/model/year
+            comparable_count = session.execute(
+                select(sql_func.count(CarListing.id))
+                .where(
+                    CarListing.make == r.make,
+                    CarListing.model == r.model,
+                    CarListing.year == r.year,
+                    CarListing.price.isnot(None),
+                    CarListing.kilometers.isnot(None)
+                )
+            ).scalar() or 0
+            
+            # Store comparable count in the dict for sorting
+            d["comparable_count"] = comparable_count
+            
+            if comparable_count >= MIN_COMPARABLE_CARS:
+                valid_with_comparables.append(d)
+            else:
+                valid_without_comparables.append(d)
+                filtered_insufficient_comparables += 1
+        
+        if filtered_insufficient_comparables > 0:
+            print(f"Filtered out {filtered_insufficient_comparables} candidates with <{MIN_COMPARABLE_CARS} comparable cars")
 
-        # Sort again (rank desc, then pct desc), then slice to top_n
-        valid.sort(key=lambda x: (-(x["rank_score"] or float("-inf")), -(x["pct_below"] or float("-inf"))))
-        top = valid[:top_n]
+        # Sort primary list by rank/pct (best deals first)
+        valid_with_comparables.sort(key=lambda x: (-(x["rank_score"] or float("-inf")), -(x["pct_below"] or float("-inf"))))
+        
+        # Sort fallback list by comparable count FIRST (more reliable), then by rank/pct
+        valid_without_comparables.sort(key=lambda x: (-(x["comparable_count"]), -(x["rank_score"] or float("-inf")), -(x["pct_below"] or float("-inf"))))
+        
+        # Primary: use cars with enough comparables
+        top = valid_with_comparables[:top_n]
+        
+        # Fallback: if we have fewer than 5 deals, add from cars without enough comparables
+        MIN_DEALS = 5
+        if len(top) < MIN_DEALS and valid_without_comparables:
+            needed = MIN_DEALS - len(top)
+            fallback = valid_without_comparables[:needed]
+            top.extend(fallback)
+            print(f"Added {len(fallback)} fallback deals (insufficient comparables) to reach minimum of {MIN_DEALS}")
 
         # Replace daily_deals atomically
         session.execute(delete(DailyDeal))

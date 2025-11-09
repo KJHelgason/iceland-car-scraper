@@ -56,6 +56,9 @@ class CarListing(Base):
     description = Column(String)
     scraped_at = Column(DateTime)
     is_active = Column(Boolean, nullable=False, default=True)
+    image_url = Column(String, nullable=True)
+    display_make = Column(String, nullable=True)  # Pretty formatted make: "Land Rover"
+    display_name = Column(String, nullable=True)  # Pretty formatted model: "Range Rover Sport"
 
 
 # --- Reference prices (used by deal checker) ---

@@ -5,9 +5,13 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 from db.db_setup import SessionLocal
 from db.models import CarListing
-from utils.normalizer import normalize_make, normalize_model, normalize_title
+from utils.normalizer import normalize_make, normalize_model, normalize_title, pretty_make, get_display_name
+from utils.s3_uploader import download_and_upload_image
 
 BASE_URL = "https://bilasolur.is/"
+
+# Flag to enable/disable S3 uploads (set to False to keep old behavior)
+USE_S3_STORAGE = True
 
 # --- helpers ---------------------------------------------------------------
 
@@ -72,6 +76,18 @@ def extract_price(text: str | None) -> int | None:
         return int(raw.replace(".", "").replace(" ", ""))
     except ValueError:
         return None
+
+
+def extract_car_id(url: str) -> str | None:
+    """
+    Extract the unique car ID (cid) from Bilasölur URLs.
+    Example: https://bilasolur.is/CarDetails.aspx?bid=76&cid=296487&sid=... -> '296487'
+    This is the true unique identifier; other params (schid, schpage) vary by search context.
+    """
+    if not url:
+        return None
+    match = re.search(r'[?&]cid=(\d+)', url)
+    return match.group(1) if match else None
 
 
 def extract_kilometers(text: str | None) -> int | None:
@@ -175,6 +191,29 @@ async def scrape_bilasolur(max_pages: int = 3, start_urls: list[str] | None = No
                 if not link:
                     continue
 
+                # Image URL
+                image_url = None
+                img_el = await item.query_selector("img.swiper-slide")
+                if img_el:
+                    img_src = await img_el.get_attribute("src")
+                    if img_src:
+                        if not img_src.startswith("http"):
+                            temp_image_url = f"https://bilasolur.is/{img_src.lstrip('/')}"
+                        else:
+                            temp_image_url = img_src
+                        
+                        # Upload to S3 if enabled
+                        if USE_S3_STORAGE:
+                            try:
+                                # We need listing ID for S3, so we'll upload after creating the listing
+                                # For now, just store the temporary URL
+                                image_url = temp_image_url
+                            except Exception as e:
+                                print(f"  ⚠ S3 upload failed, using temporary URL: {e}")
+                                image_url = temp_image_url
+                        else:
+                            image_url = temp_image_url
+
                 # Price
                 price = None
                 price_el = await item.query_selector(".car-price")
@@ -194,11 +233,27 @@ async def scrape_bilasolur(max_pages: int = 3, start_urls: list[str] | None = No
                         if "km" in tech_text.lower():
                             kilometers = extract_kilometers(tech_text)
 
-                # Upsert
-                existing = session.query(CarListing).filter_by(url=link).first()
-
+                # Extract the unique car ID from the URL
+                # Bilasölur URLs have dynamic parameters (schid, schpage) that change,
+                # but the cid (car ID) is the true unique identifier
+                car_id = extract_car_id(link)
+                
+                # Check for existing listing by car_id (Bilasölur only)
+                existing = None
+                if car_id:
+                    existing = (
+                        session.query(CarListing)
+                        .filter_by(source="Bilasolur")
+                        .filter(CarListing.url.like(f'%cid={car_id}%'))
+                        .first()
+                    )
+                
+                # Fallback: check by URL if no car_id found
                 if not existing:
-                    # fallback: same car but new URL
+                    existing = session.query(CarListing).filter_by(url=link).first()
+
+                # Another fallback: same car details (for older listings without cid in URL)
+                if not existing:
                     existing = (
                         session.query(CarListing)
                         .filter_by(
@@ -210,6 +265,26 @@ async def scrape_bilasolur(max_pages: int = 3, start_urls: list[str] | None = No
                         )
                         .first()
                     )
+                
+                # Check for cross-source duplicate (same car from different source)
+                # If found, skip this listing since we prefer non-Bilasolur sources
+                if not existing and normalized_make and normalized_model and year and price and kilometers:
+                    cross_source_dup = (
+                        session.query(CarListing)
+                        .filter_by(
+                            make=normalized_make,
+                            model=normalized_model,
+                            year=year,
+                            price=price,
+                            kilometers=kilometers
+                        )
+                        .filter(CarListing.source != "Bilasolur")
+                        .first()
+                    )
+                    
+                    if cross_source_dup:
+                        print(f"  ⚠ Skipping: Found in {cross_source_dup.source} (preferring dealer source)")
+                        continue
 
                 if existing:
                     updated = False
@@ -225,10 +300,45 @@ async def scrape_bilasolur(max_pages: int = 3, start_urls: list[str] | None = No
                         if value is not None and getattr(existing, field) != value:
                             setattr(existing, field, value)
                             updated = True
+                    
+                    # Handle image URL - upload to S3 if enabled and not already S3 URL
+                    if image_url:
+                        needs_s3_upload = (
+                            USE_S3_STORAGE and 
+                            's3.amazonaws.com' not in (existing.image_url or '') and
+                            existing.image_url != image_url
+                        )
+                        
+                        if needs_s3_upload:
+                            try:
+                                s3_url = await download_and_upload_image(
+                                    image_url=image_url,
+                                    listing_id=existing.id,
+                                    make=normalized_make or 'unknown',
+                                    model=normalized_model or 'unknown',
+                                    year=year or 0,
+                                    source_url=link
+                                )
+                                if s3_url:
+                                    existing.image_url = s3_url
+                                    updated = True
+                                else:
+                                    # Fallback to temporary URL if S3 fails
+                                    existing.image_url = image_url
+                                    updated = True
+                            except Exception as e:
+                                print(f"  ⚠ S3 upload failed: {e}")
+                                existing.image_url = image_url
+                                updated = True
+                        elif existing.image_url != image_url:
+                            existing.image_url = image_url
+                            updated = True
+                    
                     if updated:
                         existing.scraped_at = datetime.utcnow()
                         updated_listings += 1
                 else:
+                    # Create new listing first to get ID
                     car = CarListing(
                         source="Bilasolur",
                         title=normalized_title,
@@ -238,9 +348,30 @@ async def scrape_bilasolur(max_pages: int = 3, start_urls: list[str] | None = No
                         price=price,
                         kilometers=kilometers,
                         url=link,
+                        image_url=image_url,  # Temporary URL for now
+                        display_make=pretty_make(normalized_make) if normalized_make else None,
+                        display_name=get_display_name(normalized_model) if normalized_model else None,
                         scraped_at=datetime.utcnow(),
                     )
                     session.add(car)
+                    session.flush()  # Get the ID without committing
+                    
+                    # Upload to S3 if enabled
+                    if image_url and USE_S3_STORAGE:
+                        try:
+                            s3_url = await download_and_upload_image(
+                                image_url=image_url,
+                                listing_id=car.id,
+                                make=normalized_make or 'unknown',
+                                model=normalized_model or 'unknown',
+                                year=year or 0,
+                                source_url=link
+                            )
+                            if s3_url:
+                                car.image_url = s3_url
+                        except Exception as e:
+                            print(f"  ⚠ S3 upload failed for new listing: {e}")
+                    
                     new_listings += 1
 
             session.commit()
