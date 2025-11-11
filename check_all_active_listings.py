@@ -215,8 +215,11 @@ async def check_all_active_listings(sources=None, limit_per_source=None, batch_s
                     
                     if is_active is False:
                         print(f"  ✗ INACTIVE: {reason}")
+                        # Only update scraped_at if this is the FIRST time we're marking it inactive
+                        # This preserves the "sold_at" timestamp for your website
+                        if listing.is_active:  # Was active, now becoming inactive
+                            listing.scraped_at = datetime.utcnow()  # Record when it became inactive
                         listing.is_active = False
-                        listing.scraped_at = datetime.utcnow()  # Update scraped_at to mark when deactivated
                         source_stats['now_inactive'] += 1
                         stats['now_inactive'] += 1
                     elif is_active is True:

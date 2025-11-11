@@ -226,8 +226,11 @@ async def check_oldest_listings(limit_per_source=100):
                     
                     # Update listing
                     if not result['is_active']:
+                        # Only update scraped_at if this is the FIRST time we're marking it inactive
+                        # This preserves the "sold_at" timestamp for your website
+                        if listing.is_active:  # Was active, now becoming inactive
+                            listing.scraped_at = datetime.utcnow()  # Record when it became inactive (sold_at)
                         listing.is_active = False
-                        listing.scraped_at = datetime.utcnow()  # Update as "sold_at" date
                         marked_inactive += 1
                     
                     if result['image_url']:
