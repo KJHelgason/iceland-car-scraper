@@ -176,18 +176,33 @@ async def job_sequential_scraping():
     log.info("Sequential scraping sequence complete")
     log.info("="*70)
 
+async def job_facebook_url_discovery():
+    """
+    Discover Facebook Marketplace listing URLs.
+    Runs every 6 hours to catch new listings throughout the day.
+    """
+    global facebook_seed_urls
+    try:
+        log.info("Starting Facebook URL discovery")
+        new_urls = await discover_facebook_links(max_scrolls=100)
+        # Merge with existing URLs (avoid duplicates)
+        facebook_seed_urls = list(set(facebook_seed_urls + new_urls))
+        log.info(f"✓ Facebook discovery complete: {len(new_urls)} new URLs, {len(facebook_seed_urls)} total")
+    except Exception as e:
+        log.error(f"✗ Facebook discovery failed: {e}", exc_info=True)
+
 async def job_facebook_scrape_batch():
     """
     Scrape Facebook listings from discovered URLs in batches.
-    Runs hourly, processing 10 listings at a time.
+    Runs hourly, processing 50 listings at a time.
     """
     global facebook_seed_urls
     if not facebook_seed_urls:
         log.warning("No Facebook seed URLs available. Skipping batch scrape.")
         return
     
-    log.info(f"Starting Facebook batch scrape (10 listings from {len(facebook_seed_urls)} total)")
-    await scrape_facebook(max_items=10, start_urls=facebook_seed_urls)
+    log.info(f"Starting Facebook batch scrape (50 listings from {len(facebook_seed_urls)} total)")
+    await scrape_facebook(max_items=50, start_urls=facebook_seed_urls)
     update_reference_prices()
     check_for_deals()
     log.info("Finished Facebook batch scrape")
@@ -233,9 +248,12 @@ def main():
     # All scrapers run in sequence: Bilasolur → Bilaland → Hekla → Brimborg → BR → Islandsbilar → Facebook Discovery
     sched.add_job(job_sequential_scraping, CronTrigger(hour=0, minute=0), id="sequential_scraping")
     
+    # ---- Facebook URL discovery (every 6 hours to catch new listings) ----
+    sched.add_job(job_facebook_url_discovery, CronTrigger(hour="*/6", minute=0), id="facebook_discovery")
+    
     # ---- Facebook batch scraping (hourly throughout the day) ----
-    # Scrapes 10 listings per hour from discovered URLs
-    sched.add_job(job_facebook_scrape_batch, CronTrigger(hour="*/2", minute=15), id="facebook_batch")  # Every 2 hours at :15
+    # Scrapes 50 listings per hour from discovered URLs
+    sched.add_job(job_facebook_scrape_batch, CronTrigger(hour="*/1", minute=15), id="facebook_batch")  # Every 1 hour at :15
 
     # ---- Daily maintenance jobs (afternoon/evening when scraping is done) ----
     sched.add_job(job_check_oldest_listings,

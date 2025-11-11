@@ -9,7 +9,7 @@ import os
 from playwright.async_api import async_playwright
 from db.db_setup import SessionLocal
 from db.models import CarListing
-from datetime import datetime
+from datetime import datetime, timedelta
 
 FB_COOKIES_FILE = "fb_state.json"
 
@@ -123,6 +123,7 @@ async def check_listing_active(page, listing, source):
 async def check_all_active_listings(sources=None, limit_per_source=None, batch_size=10):
     """
     Check all active listings to see if they're still available.
+    Only checks listings that are older than 7 days.
     
     Args:
         sources: List of sources to check (None = all)
@@ -131,8 +132,14 @@ async def check_all_active_listings(sources=None, limit_per_source=None, batch_s
     """
     session = SessionLocal()
     
-    # Build query for active listings
-    query = session.query(CarListing).filter(CarListing.is_active == True)
+    # Only check listings older than 7 days
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    
+    # Build query for active listings older than 7 days
+    query = session.query(CarListing).filter(
+        CarListing.is_active == True,
+        CarListing.scraped_at < seven_days_ago
+    )
     
     if sources:
         query = query.filter(CarListing.source.in_(sources))

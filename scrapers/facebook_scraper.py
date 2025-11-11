@@ -73,8 +73,49 @@ def clean_text(text):
     return "\n".join(filtered)
 
 # ----- AI extraction -----
+def is_likely_vehicle(title, price_text, description):
+    """Quick pre-filter to skip obvious non-vehicle listings before AI extraction."""
+    combined_text = f"{title} {description}".lower()
+    
+    # Icelandic keywords for parts/accessories (not vehicles)
+    part_keywords = [
+        "dekk",  # tires
+        "felgur", "felgu",  # rims/wheels
+        "ljós", "ljósi",  # lights
+        "hurð", "hurðir", "hurðaspjöld",  # doors, door panels
+        "stýri",  # steering wheel
+        "sæti", "sætis",  # seats
+        "hleðslusnúra", "hleðslutæki",  # charging cable, charger
+        "pallhús",  # truck bed cover
+        "baklykill",  # lug wrench
+        "spegill",  # mirror
+        "rúða", "rúður",  # windshield
+        "púði",  # airbag
+        "varahlut", "varahluti",  # spare part
+        " rims ", " rim ",  # English
+        " tires ", " tire ",
+        " wheels ", " wheel ",
+        " parts ", " part ",
+    ]
+    
+    if any(keyword in combined_text for keyword in part_keywords):
+        return False
+    
+    # Check price - if under 100k ISK, likely a part
+    price = extract_number(price_text)
+    if price and price < 100000:
+        return False
+    
+    return True
+
+
 def extract_structured_data(title, price_text, description):
     """Extract vehicle data using configured AI provider or regex fallback."""
+    
+    # Pre-filter: Skip obvious non-vehicles
+    if not is_likely_vehicle(title, price_text, description):
+        print(f"⚠️ SKIPPING: Likely a part/accessory, not a vehicle")
+        return {}
     
     if AI_PROVIDER == "openai":
         return extract_with_openai(title, price_text, description)
@@ -86,15 +127,22 @@ def extract_structured_data(title, price_text, description):
 
 
 def extract_with_openai(title, price_text, description):
-    """Extract using OpenAI API."""
-    prompt = f"""Extract the following fields from this Facebook vehicle listing:
+    """Extract using OpenAI API with structured output."""
+    prompt = f"""Extract vehicle information from this Facebook listing. 
+    
+IMPORTANT: If this is a car PART or ACCESSORY (not a complete vehicle), return {{"is_vehicle": false}}.
+
+Common parts/accessories to reject (Icelandic):
+- dekk (tires), felgur (rims), ljós (lights), hurðaspjöld (door panels)
+- pallhús (truck bed cover), hleðslusnúra (charging cable)
+- varahlutir (spare parts), speglar (mirrors), sæti (seats)
 
 Title: {title}
 Price: {price_text}
 Description:
 {description}
 
-Extract:
+Extract ONLY if this is a complete VEHICLE for sale:
 - Make (car manufacturer)
 - Model (car model name)
 - Year (4 digits)
@@ -106,32 +154,100 @@ Rules:
 - Ignore unrelated numbers like "Joined Facebook in 2023".
 - If mileage is in thousands (e.g., "145 þúsund"), convert to full number (145000).
 - If no mileage is given, return null.
+- If any field cannot be determined, return null for that field.
+- If this is NOT a vehicle (parts, accessories, etc.), return {{"is_vehicle": false}}
 
-Return ONLY valid JSON with this exact structure:
-{{"make": "...", "model": "...", "year": 2020, "price": 1500000, "mileage": 145000}}"""
+Return ONLY valid JSON:
+{{"is_vehicle": true, "make": "...", "model": "...", "year": 2020, "price": 1500000, "mileage": 145000}}
+OR
+{{"is_vehicle": false}}"""
     
     try:
+        # Log input data
+        print("\n" + "="*80)
+        print("🤖 AI EXTRACTION - INPUT DATA")
+        print("="*80)
+        print(f"Title: {title}")
+        print(f"Price Text: {price_text}")
+        print(f"Description (first 200 chars): {description[:200] if description else 'None'}...")
+        print("="*80)
+        
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",  # Cheaper and faster
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a data extraction assistant. Return only valid JSON, no markdown or explanations."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0,
-            max_tokens=200
+            max_tokens=200,
+            response_format={"type": "json_object"}  # Force JSON output
         )
         
         text = response.choices[0].message.content.strip()
-        # Remove markdown code blocks if present
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            text = text.rsplit("```", 1)[0]
+        data = json.loads(text)
         
-        json_str = text[text.find("{"): text.rfind("}") + 1]
-        data = json.loads(json_str)
+        # Log raw AI output
+        print("🤖 AI EXTRACTION - RAW OUTPUT")
+        print("="*80)
+        print(f"Raw JSON: {text}")
+        print("="*80)
+        
+        # Check if AI classified as non-vehicle
+        if data.get("is_vehicle") == False:
+            print("🚫 AI CLASSIFIED AS NON-VEHICLE (part/accessory)")
+            print("="*80 + "\n")
+            return {}
+        
+        # Validate extracted data
+        validation_messages = []
+        
+        if data.get("year"):
+            year = int(data["year"])
+            # Year should be between 1950 and current year + 2
+            if year < 1950 or year > datetime.now().year + 2:
+                validation_messages.append(f"❌ Invalid year: {year} (must be 1950-{datetime.now().year + 2})")
+                data["year"] = None
+            else:
+                validation_messages.append(f"✅ Year: {year}")
+        else:
+            validation_messages.append("⚠️ Year: None")
+        
+        if data.get("price"):
+            price = int(data["price"])
+            # Price should be reasonable (100k - 100M ISK)
+            if price < 100000 or price > 100000000:
+                validation_messages.append(f"❌ Invalid price: {price:,} ISK (must be 100k-100M)")
+                data["price"] = None
+            else:
+                validation_messages.append(f"✅ Price: {price:,} ISK")
+        else:
+            validation_messages.append("⚠️ Price: None")
+        
+        if data.get("mileage"):
+            mileage = int(data["mileage"])
+            # Mileage should be reasonable (0 - 1M km)
+            if mileage < 0 or mileage > 1000000:
+                validation_messages.append(f"❌ Invalid mileage: {mileage:,} km (must be 0-1M)")
+                data["mileage"] = None
+            else:
+                validation_messages.append(f"✅ Mileage: {mileage:,} km")
+        else:
+            validation_messages.append("⚠️ Mileage: None")
+        
+        validation_messages.append(f"✅ Make: {data.get('make', 'None')}")
+        validation_messages.append(f"✅ Model: {data.get('model', 'None')}")
+        
+        # Log validation results
+        print("🤖 AI EXTRACTION - VALIDATION")
+        print("="*80)
+        for msg in validation_messages:
+            print(msg)
+        print("="*80 + "\n")
+        
         return data
     except Exception as e:
-        print(f"OpenAI extraction failed: {e}")
+        print(f"❌ OpenAI extraction failed: {e}")
+        print("Falling back to regex extraction")
         # Fallback to regex
         return extract_with_regex(title, price_text, description)
 
