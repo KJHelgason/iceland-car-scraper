@@ -17,7 +17,7 @@ async def discover_hekla_links():
     discovered_urls = []
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         
         print(f"Navigating to {BASE_URL}...")
