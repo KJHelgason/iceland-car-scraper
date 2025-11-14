@@ -80,52 +80,60 @@ def should_delete_as_non_car(make: Optional[str]) -> bool:
 # Duplicate removal
 # ----------------------------
 # Cross-source duplicate detection:
-# - Group by: make, model, year, price, km (NOT source)
+# - Group by: make, model_base (ignoring trim), year, price, km (NOT source)
+# - This catches duplicates like "Santa Fe 2 7 V6" vs "Santa Fe"
 # - Preference order when choosing which to keep:
 #   1. Non-Bilasolur sources (dealer direct is more authoritative)
-#   2. Newest scraped_at (most recent data)
-#   3. Highest ID (tiebreaker)
+#   2. Longest model name (more detailed)
+#   3. Newest scraped_at (most recent data)
+#   4. Highest ID (tiebreaker)
 # ----------------------------
 def remove_exact_duplicates(session: Session) -> int:
-    print("[Duplicates] Checking for cross-source duplicates...")
-    rows = session.execute(
-        select(
-            CarListing.make, CarListing.model, CarListing.year,
-            CarListing.price, CarListing.kilometers,
-            func.count(CarListing.id)
-        ).group_by(
-            CarListing.make, CarListing.model, CarListing.year,
-            CarListing.price, CarListing.kilometers
-        ).having(func.count(CarListing.id) > 1)
-    ).all()
-
-    print(f"[Duplicates] Found {len(rows)} duplicate groups (cross-source).")
+    from utils.normalizer import model_base
+    
+    print("[Duplicates] Checking for cross-source duplicates (using model base)...")
+    
+    # Get all listings with computed model_base
+    all_listings = session.execute(select(CarListing)).scalars().all()
+    
+    # Group by make, model_base, year, price, km
+    from collections import defaultdict
+    groups = defaultdict(list)
+    
+    for listing in all_listings:
+        if not all([listing.make, listing.model, listing.year, listing.price, listing.kilometers]):
+            continue
+        
+        base = model_base(listing.model)
+        if not base:
+            continue
+            
+        key = (listing.make, base, listing.year, listing.price, listing.kilometers)
+        groups[key].append(listing)
+    
+    # Find groups with multiple listings
+    duplicate_groups = {k: v for k, v in groups.items() if len(v) > 1}
+    
+    print(f"[Duplicates] Found {len(duplicate_groups)} duplicate groups (cross-source, by model base).")
     deleted = 0
-    for (make, model, year, price, km, cnt) in rows:
-        print(f"  - Processing dup group: {make} {model} {year}, {price} ISK, {km} km, count={cnt}")
-        dups = session.execute(
-            select(CarListing).where(
-                CarListing.make == make,
-                CarListing.model == model,
-                CarListing.year == year,
-                CarListing.price == price,
-                CarListing.kilometers == km
-            ).order_by(
-                # Prefer non-Bilasolur sources first
-                # In SQL, FALSE (0) sorts before TRUE (1) in ASC order
-                # So we want "source != 'Bilasolur'" to be TRUE (1) for non-Bilasolur, FALSE (0) for Bilasolur
-                # Then sort descending to put TRUE (non-Bilasolur) first
-                desc(CarListing.source != 'Bilasolur'),
-                nullslast(CarListing.scraped_at.desc()),
-                CarListing.id.desc()
-            )
-        ).scalars().all()
-
-        keep = dups[0]
-        to_delete = dups[1:]
+    
+    for (make, base, year, price, km), dups in duplicate_groups.items():
+        print(f"  - Processing dup group: {make} {base} {year}, {price} ISK, {km} km, count={len(dups)}")
+        
+        # Sort to determine which to keep
+        # Priority: non-Bilasolur > longer model name > newer scraped_at > higher ID
+        sorted_dups = sorted(dups, key=lambda x: (
+            x.source != 'Bilasolur',  # Non-Bilasolur first (True > False)
+            len(x.model or ''),  # Longer model name (more detailed)
+            x.scraped_at or datetime.min,  # Newer scraped_at
+            x.id or 0  # Higher ID
+        ), reverse=True)
+        
+        keep = sorted_dups[0]
+        to_delete = sorted_dups[1:]
         
         if to_delete:
-            print(f"    ✓ Keeping: {keep.source} id={keep.id}")
+            print(f"    ✓ Keeping: {keep.source} id={keep.id} model='{keep.model}'")
         
         for row in to_delete:
             # Delete S3 image if exists
@@ -133,10 +141,10 @@ def remove_exact_duplicates(session: Session) -> int:
                 delete_s3_image(row.image_url)
             session.delete(row)
             deleted += 1
-            print(f"    ✗ Deleted: {row.source} id={row.id}, url={row.url[:60]}...")
+            print(f"    ✗ Deleted: {row.source} id={row.id} model='{row.model}', url={row.url[:60]}...")
     
     session.commit()
-    print(f"[Duplicates] Removed {deleted} exact duplicates (preferring non-Bilasolur sources).")
+    print(f"[Duplicates] Removed {deleted} exact duplicates (using model base, preferring detailed models).")
     return deleted
 
 

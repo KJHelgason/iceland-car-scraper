@@ -48,7 +48,7 @@ async def discover_facebook_links(max_scrolls=100):
         state = json.load(f)
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(storage_state=state)
         page = await context.new_page()
         
