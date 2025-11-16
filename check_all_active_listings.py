@@ -32,6 +32,16 @@ async def check_listing_active(page, listing, source):
             if 'unavailable_product' in current_url:
                 return False, "Redirected to unavailable_product"
             
+            # Check for "Sold" in title (common indicator)
+            try:
+                title_el = await page.query_selector('h1 span[dir="auto"]')
+                if title_el:
+                    title_text = (await title_el.inner_text()).lower()
+                    if title_text.startswith('sold') or '\nsold\n' in title_text:
+                        return False, "Title shows 'Sold'"
+            except Exception:
+                pass
+            
             if any(phrase in page_text_lower for phrase in [
                 "this content isn't available",
                 "content not found",

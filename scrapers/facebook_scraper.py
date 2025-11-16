@@ -436,7 +436,14 @@ async def scrape_facebook(max_items=20, start_urls=None):
             price_el = await container.query_selector('span:has-text("ISK"), span:has-text("kr")')
             price_text = await price_el.inner_text() if price_el else None
 
+            # Try primary description xpath, then fallbacks
             desc_el = await page.query_selector('xpath=/html/body/div[1]/div/div[1]/div/div[3]/div/div/div[1]/div[1]/div[2]/div/div/div/div/div/div[1]/div[2]/div/div[2]/div/div[1]/div[1]/div[5]/div[2]/div')
+            if not desc_el:
+                # Fallback: try class-based selector
+                desc_el = await page.query_selector('div.xz9dl7a.xn6708d.xsag5q8.x1ye3gou')
+            if not desc_el:
+                # Fallback: use container (includes all listing content)
+                desc_el = container
             raw_description = await desc_el.inner_text() if desc_el else None
             description = clean_text(raw_description)
 
