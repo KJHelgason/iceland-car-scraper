@@ -44,12 +44,17 @@ def extract_mileage(text):
     if not text:
         return None
     text = str(text).lower()
-    # Prefer "Ekinn"/"Keyrður" style
-    match = re.search(r"(?:ekinn|keyrður)\s*(\d[\d.,]*)\s*(?:km|kílómetrar|þúsund)?", text)
+    # Prefer "Ekinn"/"Keyrður" style but allow intervening words
+    # e.g. "Ekinn aðeins 99.000km"
+    match = re.search(r"(?:ekinn|keyrður)(?:\s+\S+){0,5}?\s*(\d[\d.,]*)\s*(?:km|kílómetrar|þúsund)?", text)
     if not match:
+        # Generic number followed by km (covers '99,503 km', '99.000km', '📍 Mileage: 99,503 km')
         match = re.search(r"(\d[\d.,]*)\s*(?:km|kílómetrar|þúsund)", text)
     if match:
-        value = match.group(1).replace(".", "").replace(",", "")
+        raw = match.group(1)
+        # Normalize number separators
+        value = raw.replace(".", "").replace(",", "")
+        # If the text contains the Icelandic word 'þúsund', interpret as thousands
         if "þúsund" in text:
             try:
                 return int(value) * 1000
@@ -77,32 +82,32 @@ def is_likely_vehicle(title, price_text, description):
     """Quick pre-filter to skip obvious non-vehicle listings before AI extraction."""
     combined_text = f"{title} {description}".lower()
     
-    # Icelandic keywords for parts/accessories (not vehicles)
-    part_keywords = [
-        "dekk",  # tires
-        "felgur", "felgu",  # rims/wheels
-        "ljós", "ljósi",  # lights
-        "hurð", "hurðir", "hurðaspjöld",  # doors, door panels
-        "stýri",  # steering wheel
-        "sæti", "sætis",  # seats
-        "hleðslusnúra", "hleðslutæki",  # charging cable, charger
+    # Check price first - if over 500k ISK, almost certainly a vehicle
+    price = extract_number(price_text)
+    if price and price >= 500000:
+        return True  # High price = likely vehicle, skip part keywords check
+    
+    # For lower prices, check for part-only listings (title-heavy indicators)
+    # These keywords in TITLE strongly suggest parts/accessories only
+    title_lower = title.lower()
+    title_only_part_keywords = [
+        "til sölu dekk",  # "tires for sale"
+        "felgur til sölu",  # "rims for sale"
+        "sumardekk",  # summer tires (when in title)
+        "nagladekk",  # studded tires (when in title)
         "pallhús",  # truck bed cover
-        "baklykill",  # lug wrench
-        "spegill",  # mirror
-        "rúða", "rúður",  # windshield
-        "púði",  # airbag
-        "varahlut", "varahluti",  # spare part
-        " rims ", " rim ",  # English
-        " tires ", " tire ",
-        " wheels ", " wheel ",
-        " parts ", " part ",
+        "hleðslusnúra",  # charging cable
+        "varahlut",  # spare part
+        "hurðaspjöld",  # door panels
+        " rims for sale",
+        " tires for sale",
+        " wheels for sale",
     ]
     
-    if any(keyword in combined_text for keyword in part_keywords):
+    if any(keyword in title_lower for keyword in title_only_part_keywords):
         return False
     
     # Check price - if under 100k ISK, likely a part
-    price = extract_number(price_text)
     if price and price < 100000:
         return False
     
@@ -243,7 +248,13 @@ OR
         for msg in validation_messages:
             print(msg)
         print("="*80 + "\n")
-        
+        # If AI omitted mileage, try a regex fallback on title+description
+        if not data.get("mileage"):
+            fallback_m = extract_mileage(f"{title}\n{description}")
+            if fallback_m and 0 <= fallback_m <= 1000000:
+                data["mileage"] = fallback_m
+                print(f"ℹ️ Filled mileage from regex fallback: {fallback_m} km")
+
         return data
     except Exception as e:
         print(f"❌ OpenAI extraction failed: {e}")
