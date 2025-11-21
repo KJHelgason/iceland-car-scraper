@@ -10,6 +10,13 @@ import json
 import os
 from datetime import datetime
 from playwright.async_api import async_playwright
+from facebook_item_tracker import (
+    extract_item_id, 
+    get_scraped_item_ids, 
+    get_rejected_item_ids,
+    update_last_seen,
+    mark_old_listings_inactive
+)
 
 FB_URL = "https://www.facebook.com/marketplace/category/vehicles"
 COOKIES_FILE = "fb_state.json"
@@ -32,17 +39,29 @@ ICELAND_LOCATIONS = [
 async def discover_facebook_links(max_scrolls=100):
     """Scroll Facebook Marketplace and collect all listing URLs.
     Uses targeted searches for Iceland and popular car makes.
+    Only adds NEW URLs that haven't been scraped or rejected before.
     
     Args:
         max_scrolls: Maximum number of scroll iterations per search
         
     Returns:
-        List of listing URLs
+        List of NEW listing URLs (not yet scraped or rejected)
     """
     
     if not os.path.exists(COOKIES_FILE):
         print(f"Error: {COOKIES_FILE} not found. Please run save_fb_cookies.py first.")
         return []
+    
+    # Load already scraped and rejected item IDs from database
+    print("Loading existing item IDs from database...")
+    scraped_ids = get_scraped_item_ids()
+    rejected_ids = get_rejected_item_ids()
+    known_ids = scraped_ids | rejected_ids
+    
+    print(f"  - {len(scraped_ids):,} already scraped")
+    print(f"  - {len(rejected_ids):,} rejected (non-cars/errors)")
+    print(f"  - {len(known_ids):,} total to skip")
+    print()
     
     with open(COOKIES_FILE, "r") as f:
         state = json.load(f)
@@ -54,6 +73,9 @@ async def discover_facebook_links(max_scrolls=100):
         
         # Set to track unique URLs
         listing_urls = set()
+        new_urls = set()  # Track truly new URLs
+        skipped_known = 0
+        updated_seen = 0
         
         # Search strategies
         # Category parameter: categoryID=vehicles (807311116126722)
@@ -124,24 +146,39 @@ async def discover_facebook_links(max_scrolls=100):
                 while scroll_count < max_scrolls:
                     scroll_count += 1
                     
-                    # Get all listing links on the page
-                    links = await page.query_selector_all('a[href*="/marketplace/item/"]')
-                    
-                    before_count = len(listing_urls)
-                    for link in links:
-                        href = await link.get_attribute("href")
-                        if href and "/marketplace/item/" in href:
-                            # Clean URL - remove query params and hash
-                            clean_url = href.split("?")[0].split("#")[0]
-                            # Ensure full URL
-                            if not clean_url.startswith("http"):
-                                clean_url = f"https://www.facebook.com{clean_url}"
-                            listing_urls.add(clean_url)
-                    
-                    new_items = len(listing_urls) - before_count
-                    print(f"  Scroll {scroll_count}/{max_scrolls}: Found {new_items} new listings (total: {len(listing_urls)})")
-                    
-                    # Check if we're getting new items
+                # Get all listing links on the page
+                links = await page.query_selector_all('a[href*="/marketplace/item/"]')
+                
+                before_count = len(listing_urls)
+                for link in links:
+                    href = await link.get_attribute("href")
+                    if href and "/marketplace/item/" in href:
+                        # Clean URL - remove query params and hash
+                        clean_url = href.split("?")[0].split("#")[0]
+                        # Ensure full URL
+                        if not clean_url.startswith("http"):
+                            clean_url = f"https://www.facebook.com{clean_url}"
+                        
+                        # Extract item ID and check if we should skip it
+                        item_id = extract_item_id(clean_url)
+                        if item_id:
+                            if item_id in known_ids:
+                                skipped_known += 1
+                                
+                                # Update last_seen_at for already-scraped items
+                                if item_id in scraped_ids:
+                                    update_last_seen(clean_url)
+                                    updated_seen += 1
+                                
+                                continue  # Skip this URL - already processed
+                            else:
+                                # This is a NEW item!
+                                new_urls.add(clean_url)
+                        
+                        listing_urls.add(clean_url)
+                
+                new_items = len(listing_urls) - before_count
+                print(f"  Scroll {scroll_count}/{max_scrolls}: Found {new_items} new listings (total: {len(listing_urls)}, {len(new_urls)} truly new)")                    # Check if we're getting new items
                     if new_items == 0:
                         no_new_items_count += 1
                         if no_new_items_count >= 3:
@@ -160,22 +197,36 @@ async def discover_facebook_links(max_scrolls=100):
         
         await browser.close()
     
-    # Convert to sorted list
-    urls = sorted(list(listing_urls))
+    # Mark old listings as inactive (not seen in 7+ days)
+    print("\nChecking for old listings to mark inactive...")
+    mark_old_listings_inactive(days_threshold=7)
     
-    # Save to file with timestamp
+    # Convert new URLs to sorted list (only truly new ones go in seed file!)
+    new_urls_list = sorted(list(new_urls))
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"Discovery Summary:")
+    print(f"  - {len(listing_urls):,} total URLs found on Facebook")
+    print(f"  - {skipped_known:,} skipped (already scraped/rejected)")
+    print(f"  - {updated_seen:,} existing listings updated last_seen_at")
+    print(f"  - {len(new_urls_list):,} NEW URLs to add to seed file")
+    print(f"{'='*60}\n")
+    
+    # Save ONLY new URLs to file with timestamp
     with open(SEED_LINKS_FILE, "w", encoding="utf-8") as f:
         f.write(f"# Facebook Marketplace seed links\n")
         f.write(f"# Generated: {datetime.now().isoformat()}\n")
-        f.write(f"# Total URLs: {len(urls)}\n")
+        f.write(f"# Total NEW URLs: {len(new_urls_list)}\n")
+        f.write(f"# (Excludes {len(known_ids):,} already scraped/rejected)\n")
         f.write("#\n")
-        for url in urls:
+        for url in new_urls_list:
             f.write(f"{url}\n")
     
-    print(f"\nDiscovered {len(urls)} unique listing URLs")
+    print(f"Discovered {len(new_urls_list):,} NEW listing URLs (out of {len(listing_urls):,} total)")
     print(f"Saved to {SEED_LINKS_FILE}")
     
-    return urls
+    return new_urls_list
 
 
 if __name__ == "__main__":

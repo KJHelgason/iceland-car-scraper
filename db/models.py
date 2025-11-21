@@ -56,6 +56,7 @@ class CarListing(Base):
     description = Column(String)
     scraped_at = Column(DateTime)
     is_active = Column(Boolean, nullable=False, default=True)
+    last_seen_at = Column(DateTime, nullable=True)  # Track when listing was last seen in discovery
     image_url = Column(String, nullable=True)
     display_make = Column(String, nullable=True)  # Pretty formatted make: "Land Rover"
     display_name = Column(String, nullable=True)  # Pretty formatted model: "Range Rover Sport"
@@ -184,3 +185,15 @@ class ManualReview(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     listing = relationship("CarListing", lazy="joined")
+
+
+# --- Rejected Facebook items (non-vehicles, failed scrapes, etc.) ---
+class RejectedFacebookItem(Base):
+    __tablename__ = "rejected_facebook_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(String, unique=True, nullable=False, index=True)  # Facebook item ID from URL
+    reason = Column(String, nullable=False, index=True)  # 'non_vehicle', 'navigation_failed', 'invalid_data'
+    rejected_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    notes = Column(Text, nullable=True)  # Optional details about why rejected
+

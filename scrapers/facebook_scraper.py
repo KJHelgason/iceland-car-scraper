@@ -8,6 +8,7 @@ from playwright.async_api import async_playwright
 from db.db_setup import SessionLocal
 from db.models import CarListing
 from utils.normalizer import normalize_make, normalize_model, normalize_title, pretty_make, get_display_name  # ✅ NEW
+from scrapers.facebook_item_tracker import extract_item_id, add_rejected_item, update_last_seen
 
 # Choose AI provider: 'openai' or 'gemini' or 'regex' (no AI)
 AI_PROVIDER = os.getenv("AI_PROVIDER", "openai")  # Default to OpenAI
@@ -114,12 +115,19 @@ def is_likely_vehicle(title, price_text, description):
     return True
 
 
-def extract_structured_data(title, price_text, description):
+def extract_structured_data(title, price_text, description, url=None):
     """Extract vehicle data using configured AI provider or regex fallback."""
     
     # Pre-filter: Skip obvious non-vehicles
     if not is_likely_vehicle(title, price_text, description):
         print(f"⚠️ SKIPPING: Likely a part/accessory, not a vehicle")
+        
+        # Track this as rejected
+        if url:
+            item_id = extract_item_id(url)
+            if item_id:
+                add_rejected_item(item_id, "non_vehicle", f"Title: {title}")
+        
         return {}
     
     if AI_PROVIDER == "openai":
@@ -462,8 +470,8 @@ async def scrape_facebook(max_items=20, start_urls=None):
             except Exception as e:
                 print(f"Failed to extract image URL: {e}")
 
-            # Extract with Gemini
-            structured = extract_structured_data(title, price_text, description)
+            # Extract with AI/regex
+            structured = extract_structured_data(title, price_text, description, url)
 
             # Normalize make/model after LLM extraction
             raw_make = structured.get("make")
@@ -477,13 +485,19 @@ async def scrape_facebook(max_items=20, start_urls=None):
             if mileage is None:
                 mileage = extract_mileage(description)
 
-            # Skip non-vehicles
+            # Skip non-vehicles (already tracked as rejected in extract_structured_data)
             if structured == {}:
                 print(f"Skipping non-vehicle listing: {title}")
                 continue
             if price and price > 100_000_000:
                 print(f"Skipping unrealistic price for {title}: {price}")
+                item_id = extract_item_id(url)
+                if item_id:
+                    add_rejected_item(item_id, "invalid_data", f"Unrealistic price: {price}")
                 continue
+
+            # Update last_seen_at timestamp (this listing is still active on Facebook)
+            update_last_seen(url)
 
             # Normalize URL to handle Facebook's changing tracking parameters
             normalized_url = normalize_facebook_url(url)
