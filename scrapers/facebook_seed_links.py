@@ -10,7 +10,7 @@ import json
 import os
 from datetime import datetime
 from playwright.async_api import async_playwright
-from facebook_item_tracker import (
+from scrapers.facebook_item_tracker import (
     extract_item_id, 
     get_scraped_item_ids, 
     get_rejected_item_ids,
