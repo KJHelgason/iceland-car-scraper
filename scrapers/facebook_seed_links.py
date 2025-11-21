@@ -178,16 +178,18 @@ async def discover_facebook_links(max_scrolls=100):
                         listing_urls.add(clean_url)
                 
                 new_items = len(listing_urls) - before_count
-                print(f"  Scroll {scroll_count}/{max_scrolls}: Found {new_items} new listings (total: {len(listing_urls)}, {len(new_urls)} truly new)")                    # Check if we're getting new items
-                    if new_items == 0:
-                        no_new_items_count += 1
-                        if no_new_items_count >= 3:
-                            print("  No new listings found after 3 scrolls. Moving to next search.")
-                            break
-                    else:
-                        no_new_items_count = 0
-                    
-                    # Scroll to bottom
+                print(f"  Scroll {scroll_count}/{max_scrolls}: Found {new_items} new listings (total: {len(listing_urls)}, {len(new_urls)} truly new)")
+                
+                # Check if we're getting new items
+                if new_items == 0:
+                    no_new_items_count += 1
+                    if no_new_items_count >= 3:
+                        print("  No new listings found after 3 scrolls. Moving to next search.")
+                        break
+                else:
+                    no_new_items_count = 0
+                
+                # Scroll to bottom
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await asyncio.sleep(2)
                     
